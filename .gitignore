@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+data/
+log/
+models/
+models_1024/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+__pycache__/
+.ipynb_checkpoints/
