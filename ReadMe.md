@@ -30,10 +30,10 @@ pip install -e .
 python scripts/test_temporal_model.py
 ```
 
-### 2. Create Example Data
+### 2. Generate Data
 
 ```bash
-python scripts/complete_workflow_example.py
+python generate_spad_flux_dataset.py
 ```
 
 ### 3. Train
