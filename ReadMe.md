@@ -40,18 +40,20 @@ python generate_spad_flux_dataset.py
 
 ```bash
 python scripts/temporal_train.py \
-    --data_path data/log_flux_train.pt \
-    --sequence_length 256 \
+    --data_path data/new_log_flux_dataset.pt \
+    --sequence_length 1024 \
     --num_channels 64 \
     --channel_mult "1,2,3,4" \
     --num_res_blocks 2 \
-    --attention_resolutions "32,16" \
-    --batch_size 16 \
+    --attention_resolutions "500,250" \
+    --batch_size 64 \
     --lr 1e-4 \
     --diffusion_steps 1000 \
     --noise_schedule linear \
     --save_interval 10000 \
-    --lr_anneal_steps 200000
+    --lr_anneal_steps 200000 \
+    --normalize False \
+    --log_dir log
 ```
 
 ### 4. Generate Samples
@@ -88,16 +90,43 @@ Data is automatically normalized to `[-1, 1]` during loading. To disable: `--nor
 
 The model uses a 1D UNet (`dims=1`) with the following default configuration:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `sequence_length` | 256 | Temporal dimension |
-| `num_channels` | 64 | Base channel count |
-| `channel_mult` | (1,2,3,4) | Per-resolution multipliers |
-| `attention_resolutions` | 32, 16 | Where self-attention is applied |
-| `diffusion_steps` | 1000 | DDPM timesteps |
-| `noise_schedule` | linear | Beta schedule type |
 
-**Shape flow:** `[B, 1, 256]` → Conv1d → ResBlocks + Attention → Downsample/Upsample → `[B, 1, 256]`
+| Parameter               | Default   | Description                                 |
+| ----------------------- | --------- | ------------------------------------------- |
+| `sequence_length`       | 2000      | Temporal dimension                          |
+| `num_channels`          | 64        | Base channel count                          |
+| `channel_mult`          | (1,2,3,4) | Per-resolution multipliers                  |
+| `attention_resolutions` | 500, 250  | Where self-attention is applied (see below) |
+| `diffusion_steps`       | 1000      | DDPM timesteps                              |
+| `noise_schedule`        | linear    | Beta schedule type                          |
+
+
+**Shape flow:** `[B, 1, T]` → Conv1d → ResBlocks + Attention → Downsample/Upsample → `[B, 1, T]`
+
+### Choosing attention resolutions
+
+The `attention_resolutions` parameter specifies **spatial resolutions** (not downsample factors). Internally, `temporal_script_util.py` converts them to downsample factors via `ds = sequence_length // resolution`. The UNet applies attention wherever `ds` matches one of these factors.
+
+With `channel_mult=(1,2,3,4)`, the UNet has 3 downsamples, producing these `ds` values:
+
+
+| Level | ds  | Resolution (T=2000) | Resolution (T=1024) |
+| ----- | --- | ------------------- | ------------------- |
+| 0     | 1   | 2000                | 1024                |
+| 1     | 2   | 1000                | 512                 |
+| 2     | 4   | 500                 | 256                 |
+| 3     | 8   | 250                 | 128                 |
+
+
+**You must set `attention_resolutions` to values from the Resolution column for your sequence length**, otherwise attention layers will never activate and the model will lack long-range modeling capacity.
+
+
+| Sequence Length | Recommended `attention_resolutions` |
+| --------------- | ----------------------------------- |
+| 1024            | `"256,128"`                         |
+| 2000            | `"500,250"`                         |
+| 4096            | `"1024,512"`                        |
+
 
 ## Advanced Usage
 
@@ -127,11 +156,13 @@ mpiexec -n 4 python scripts/temporal_train.py \
 
 ## Sampling Speed vs Quality
 
-| Method | Steps | Relative Speed | Quality |
-|--------|-------|----------------|---------|
-| DDPM | 1000 | 1x | Best |
-| DDIM | 250 | ~4x | Very Good |
-| DDIM | 50 | ~20x | Good |
+
+| Method | Steps | Relative Speed | Quality   |
+| ------ | ----- | -------------- | --------- |
+| DDPM   | 1000  | 1x             | Best      |
+| DDIM   | 250   | ~4x            | Very Good |
+| DDIM   | 50    | ~20x           | Good      |
+
 
 ## Project Structure
 
@@ -155,8 +186,10 @@ improved-diffusion-main/
 
 ## Troubleshooting
 
+**Samples look flat or lack structure:** Check that `attention_resolutions` actually matches your sequence length (see table above). If the values don't correspond to real downsample levels, attention never activates and the model has no long-range capacity.
+
 **Samples look noisy:** Train longer (loss should still be decreasing), increase model size (`--num_channels 128`), or try cosine schedule (`--noise_schedule cosine`).
 
-**Training too slow:** Use a smaller model (`--num_channels 32`), reduce attention (`--attention_resolutions "16"`), enable FP16, or use multi-GPU.
+**Training too slow:** Use a smaller model (`--num_channels 32`), reduce attention resolutions to one level, enable FP16, or use multi-GPU.
 
 **Import errors:** Run `pip install torch numpy blobfile mpi4py tqdm` or `pip install -e .`.
