@@ -24,9 +24,11 @@ python batch_inference.py \
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -755,6 +757,43 @@ def main() -> None:
             avg_Relative_MAE=agg["Relative MAE"],
             avg_Correlation=agg["Correlation"],
         )
+
+        # Write human-readable + machine-parseable log file.
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "config": {
+                "dataset": args.dataset,
+                "checkpoint": args.checkpoint,
+                "num_samples": args.num_samples,
+                "seed": args.seed,
+                "ppp": ppp,
+                "n_spad_frames": args.n_spad_frames,
+                "sequence_length": args.sequence_length,
+                "diffusion_steps": args.diffusion_steps,
+                "sampling_steps": args.sampling_steps,
+                "lambda_data": args.lambda_data,
+                "eta": args.eta,
+                "pp_solver_iters": args.pp_solver_iters,
+                "pp_lr_scale": args.pp_lr_scale,
+                "t_total": args.t_total,
+                "dark_count": args.dark_count,
+                "x_param": args.x_param,
+                "normalize_flux": args.normalize_flux,
+                "flux_peak": args.flux_peak,
+                "num_channels": args.num_channels,
+                "infer_batch_size": args.infer_batch_size,
+            },
+            "results": {
+                "n_valid": n_valid,
+                "n_total": args.num_samples,
+                "n_dropped": args.num_samples - n_valid,
+                "avg_metrics": agg,
+            },
+        }
+        log_path = os.path.join(args.output_dir, f"metrics_{tag}.json")
+        with open(log_path, "w") as f:
+            json.dump(log_entry, f, indent=2)
+        print(f"Log saved to {log_path}")
 
 
 if __name__ == "__main__":
