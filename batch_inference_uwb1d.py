@@ -414,8 +414,10 @@ def main() -> None:
             np.save(os.path.join(args.output_dir, f"binary_{tag}.npy"), binary_all)
 
         # 2) Run UWB 1D inference.
+        #    The raw UWB output is a rate estimate (events/sec), NOT physical flux.
+        #    Matching the notebook, metrics are computed on raw rate vs. flux_true
+        #    (no SPAD model inversion).
         recon_rate_all = np.zeros((args.num_samples, args.sequence_length), dtype=np.float64)
-        flux_hat_all = np.zeros((args.num_samples, args.sequence_length), dtype=np.float64)
 
         for i in tqdm(range(args.num_samples), desc="UWB Inference", total=args.num_samples):
             recon, _, _, _, _ = simple_ihpp_uwb1d(
@@ -428,14 +430,12 @@ def main() -> None:
                 verbose=False,
             )
             recon_rate_all[i] = recon
-            flux_hat_all[i] = uwb_rate_to_flux(
-                recon, fps, float(ppp_scales[i]), float(args.dark_count),
-            )
 
         np.save(os.path.join(args.output_dir, f"recon_rate_{tag}.npy"), recon_rate_all.astype(np.float32))
-        np.save(os.path.join(args.output_dir, f"flux_hat_{tag}.npy"), flux_hat_all.astype(np.float32))
 
         # 3) Metrics (drop any sample with any NaN/inf metric).
+        #    Compare raw UWB rate output directly to flux_true (no inversion),
+        #    matching the notebook: compute_metrics(flux_true, rate_uwb).
         per_sample: Dict[str, np.ndarray] = {
             "MSE": np.full((args.num_samples,), np.nan, dtype=np.float64),
             "Relative MSE": np.full((args.num_samples,), np.nan, dtype=np.float64),
@@ -447,8 +447,8 @@ def main() -> None:
 
         for i in range(args.num_samples):
             flux_true_i = flux_sel[i].astype(np.float64)
-            flux_hat_i = np.maximum(flux_hat_all[i], 0.0)
-            m = compute_metrics(flux_true_i, flux_hat_i)
+            rate_hat_i = recon_rate_all[i].astype(np.float64)
+            m = compute_metrics(flux_true_i, rate_hat_i)
             if not is_finite_metrics(m):
                 continue
             d = m.as_dict()
