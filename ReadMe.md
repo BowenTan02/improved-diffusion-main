@@ -39,21 +39,19 @@ python generate_spad_flux_dataset.py
 ### 3. Train
 
 ```bash
-python scripts/temporal_train.py \
-    --data_path data/new_log_flux_dataset.pt \
+CUDA_VISIBLE_DEVICES=1 python scripts/temporal_train.py \
+    --data_path data/sim_log_flux_dataset.pt \
     --sequence_length 1024 \
     --num_channels 64 \
     --channel_mult "1,2,3,4" \
     --num_res_blocks 2 \
-    --attention_resolutions "500,250" \
+    --attention_resolutions "256,128" \
     --batch_size 64 \
     --lr 1e-4 \
     --diffusion_steps 1000 \
     --noise_schedule linear \
     --save_interval 10000 \
-    --lr_anneal_steps 200000 \
-    --normalize False \
-    --log_dir log
+    --lr_anneal_steps 200000 --normalize False --log_dir log
 ```
 
 ### 4. Generate Samples
