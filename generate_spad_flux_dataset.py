@@ -11,7 +11,6 @@ Output:
     - flux_dataset.npy: shape [N, 1, SEQ_LENGTH], dtype=float32
     - metadata.json: parameters and pattern types for each sample
 """
-
 import numpy as np
 from scipy import signal
 from scipy.interpolate import CubicSpline
@@ -21,32 +20,48 @@ from tqdm import tqdm
 import os
 
 # Configuration
-NUM_SAMPLES = 2000
-SEQ_LENGTH = 2000
+NUM_SAMPLES = 1000
+SEQ_LENGTH = 1024
 T_MAX = 1.0
 DT = T_MAX / SEQ_LENGTH
 FLUX_MIN = 0.0
 FLUX_MAX = 10000.0
 SMOOTH_SIGMA = 1.0
 
+# PATTERN_DISTRIBUTION = {
+#     'step_nondecreasing': 0.05,
+#     'step_general': 0.05,
+#     'gaussian_bumps': 0.05,
+#     'exponential': 0.05,
+#     'wavelet': 0.05,
+#     'periodic': 0.05,
+#     'polynomial': 0.05,
+#     'pulsed_laser': 0.05,
+#     'sigmoid_transition': 0.05,
+#     'piecewise_linear': 0.05,
+#     'plateau_with_transients': 0.05,
+#     'chirp': 0.05,
+#     'sawtooth': 0.05,
+#     'constant': 0.05,
+#     'complex_combination': 0.30,
+# }
+
 PATTERN_DISTRIBUTION = {
-    'step_nondecreasing': 0.06,
-    'step_general': 0.06,
-    'gaussian_bumps': 0.06,
-    'exponential': 0.06,
-    'wavelet': 0.06,
-    'periodic': 0.06,
-    'polynomial': 0.06,
-    'pulsed_laser': 0.04,
-    'flickering_light': 0.04,
-    'sigmoid_transition': 0.05,
-    'piecewise_linear': 0.05,
-    'plateau_with_transients': 0.05,
-    'chirp': 0.04,
-    'lorentzian_peaks': 0.04,
-    'sawtooth': 0.04,
-    'constant': 0.01,
-    'complex_combination': 0.22,
+    'step_nondecreasing': 0.0,
+    'step_general': 0.0,
+    'gaussian_bumps': 0.0,
+    'exponential': 0.0,
+    'wavelet': 0.0,
+    'periodic': 0.0,
+    'polynomial': 0.0,
+    'pulsed_laser': 0.0,
+    'sigmoid_transition': 0.0,
+    'piecewise_linear': 0.0,
+    'plateau_with_transients': 0.0,
+    'chirp': 1.0,
+    'sawtooth': .0,
+    'constant': 0.0,
+    'complex_combination': 0.0,
 }
 
 assert abs(sum(PATTERN_DISTRIBUTION.values()) - 1.0) < 1e-6, \
@@ -269,37 +284,6 @@ def generate_pulsed_laser(t):
     }
     return flux, metadata
 
-
-def generate_flickering_light(t):
-    """Flickering light source (candle or faulty LED)."""
-    base_freq = np.random.uniform(5, 50)
-    base_flux = np.random.uniform(FLUX_MAX * 0.2, FLUX_MAX / 2)
-    flux = base_flux * np.ones_like(t)
-
-    num_components = np.random.randint(3, 8)
-    for _ in range(num_components):
-        freq = base_freq * np.random.uniform(0.5, 3)
-        amplitude = np.random.uniform(0.1, 0.4) * base_flux
-        phase = np.random.uniform(0, 2 * np.pi)
-        flux += amplitude * np.sin(2 * np.pi * freq * t + phase)
-
-    num_spikes = np.random.randint(0, 5)
-    for _ in range(num_spikes):
-        spike_t = np.random.uniform(0, T_MAX)
-        spike_width = np.random.uniform(0.001, 0.01)
-        spike_amp = np.random.uniform(base_flux, FLUX_MAX)
-        flux += spike_amp * np.exp(-((t - spike_t) ** 2) / (2 * spike_width ** 2))
-
-    metadata = {
-        'type': 'flickering_light',
-        'base_frequency': float(base_freq),
-        'base_flux': float(base_flux),
-        'num_components': num_components,
-        'num_spikes': num_spikes
-    }
-    return flux, metadata
-
-
 # ============================================================================
 # Additional SPAD-relevant Patterns
 # ============================================================================
@@ -400,29 +384,6 @@ def generate_chirp(t):
     return flux, metadata
 
 
-def generate_lorentzian_peaks(t):
-    """Sum of Lorentzian (Cauchy) peaks — heavier tails than Gaussians,
-    modelling slower intensity fall-off from scattering events."""
-    num_peaks = np.random.randint(1, 8)
-    flux = np.ones_like(t) * FLUX_MIN
-
-    params = []
-    for _ in range(num_peaks):
-        center = np.random.uniform(0, T_MAX)
-        gamma = np.random.uniform(0.005, 0.08)  # half-width
-        amp = np.random.uniform(FLUX_MAX * 0.1, FLUX_MAX)
-        flux += amp * gamma ** 2 / ((t - center) ** 2 + gamma ** 2)
-        params.append({'center': float(center), 'gamma': float(gamma),
-                        'amplitude': float(amp)})
-
-    metadata = {
-        'type': 'lorentzian_peaks',
-        'num_peaks': num_peaks,
-        'params': params
-    }
-    return flux, metadata
-
-
 def generate_sawtooth(t):
     """Sawtooth / asymmetric ramp wave — models linearly-ramping then
     quickly resetting intensity (e.g. scanning or charging behaviour)."""
@@ -462,12 +423,10 @@ def generate_complex_combination(t):
         generate_periodic,
         generate_polynomial,
         generate_pulsed_laser,
-        generate_flickering_light,
         generate_sigmoid_transition,
         generate_piecewise_linear,
         generate_plateau_with_transients,
         generate_chirp,
-        generate_lorentzian_peaks,
         generate_sawtooth,
     ]
 
@@ -505,12 +464,10 @@ def generate_single_flux(t, pattern_type=None):
         'periodic': generate_periodic,
         'polynomial': generate_polynomial,
         'pulsed_laser': generate_pulsed_laser,
-        'flickering_light': generate_flickering_light,
         'sigmoid_transition': generate_sigmoid_transition,
         'piecewise_linear': generate_piecewise_linear,
         'plateau_with_transients': generate_plateau_with_transients,
         'chirp': generate_chirp,
-        'lorentzian_peaks': generate_lorentzian_peaks,
         'sawtooth': generate_sawtooth,
         'complex_combination': generate_complex_combination,
     }
@@ -588,40 +545,40 @@ def save_dataset(flux_dataset, metadata_list, output_dir='./data'):
     """Save dataset and metadata to disk."""
     os.makedirs(output_dir, exist_ok=True)
 
-    flux_path = os.path.join(output_dir, 'flux_dataset.npy')
-    np.save(flux_path, flux_dataset)
-    print(f"\n✓ Saved flux dataset to: {flux_path}")
-    print(f"  Size: {os.path.getsize(flux_path) / 1024 / 1024:.2f} MB")
+    flux_path = os.path.join(output_dir, 'gaussian_flux_dataset.npy')
+    # np.save(flux_path, flux_dataset)
+    # print(f"\n✓ Saved flux dataset to: {flux_path}")
+    # print(f"  Size: {os.path.getsize(flux_path) / 1024 / 1024:.2f} MB")
 
     eps = 1e-6
     flux_clamped = np.clip(flux_dataset, 0, None) + eps
     log_flux = np.log1p(flux_clamped)
-    log_flux_path = os.path.join(output_dir, 'log_flux_dataset.npy')
-    np.save(log_flux_path, log_flux)
-    print(f"✓ Saved log flux dataset to: {log_flux_path}")
-    print(f"  Size: {os.path.getsize(log_flux_path) / 1024 / 1024:.2f} MB")
+    log_flux_path = os.path.join(output_dir, 'gaussian_log_flux_dataset.npy')
+    # np.save(log_flux_path, log_flux)
+    # print(f"✓ Saved log flux dataset to: {log_flux_path}")
+    # print(f"  Size: {os.path.getsize(log_flux_path) / 1024 / 1024:.2f} MB")
 
-    metadata_path = os.path.join(output_dir, 'metadata.json')
-    with open(metadata_path, 'w') as f:
-        json.dump({
-            'dataset_info': {
-                'num_samples': NUM_SAMPLES,
-                'sequence_length': SEQ_LENGTH,
-                'time_range': [0, T_MAX],
-                'dt': DT,
-                'flux_range': [FLUX_MIN, FLUX_MAX],
-                'log_flux_range': [float(log_flux.min()), float(log_flux.max())],
-                'smooth_sigma': SMOOTH_SIGMA,
-                'pattern_distribution': PATTERN_DISTRIBUTION,
-            },
-            'samples': metadata_list
-        }, f, indent=2)
-    print(f"✓ Saved metadata to: {metadata_path}")
+    # metadata_path = os.path.join(output_dir, 'gaussian_metadata.json')
+    # with open(metadata_path, 'w') as f:
+    #     json.dump({
+    #         'dataset_info': {
+    #             'num_samples': NUM_SAMPLES,
+    #             'sequence_length': SEQ_LENGTH,
+    #             'time_range': [0, T_MAX],
+    #             'dt': DT,
+    #             'flux_range': [FLUX_MIN, FLUX_MAX],
+    #             'log_flux_range': [float(log_flux.min()), float(log_flux.max())],
+    #             'smooth_sigma': SMOOTH_SIGMA,
+    #             'pattern_distribution': PATTERN_DISTRIBUTION,
+    #         },
+    #         'samples': metadata_list
+    #     }, f, indent=2)
+    # print(f"✓ Saved metadata to: {metadata_path}")
 
     try:
         import torch
         log_flux_pt = torch.from_numpy(log_flux[:, 0, :])
-        log_flux_pt_path = os.path.join(output_dir, 'log_flux_dataset.pt')
+        log_flux_pt_path = os.path.join(output_dir, 'chirp_log_flux_dataset.pt')
         torch.save(log_flux_pt, log_flux_pt_path)
         print(f"✓ Saved PyTorch log flux dataset to: {log_flux_pt_path}")
         print(f"  Shape: {log_flux_pt.shape}")
@@ -656,7 +613,7 @@ def visualize_samples(flux_dataset, num_samples=10):
 
         output_dir = './data'
         os.makedirs(output_dir, exist_ok=True)
-        plot_path = os.path.join(output_dir, 'flux_samples_visualization.png')
+        plot_path = os.path.join(output_dir, 'new_flux_samples_visualization.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         print(f"✓ Saved visualization to: {plot_path}")
         plt.close()
@@ -676,7 +633,7 @@ def main():
     print("=" * 80)
     print("\nNext steps:")
     print("  1. Train temporal diffusion model:")
-    print("     python scripts/temporal_train.py --data_path data/log_flux_dataset.pt")
+    print("     python scripts/temporal_train.py --data_path data/new_log_flux_dataset.pt")
     print()
 
 
