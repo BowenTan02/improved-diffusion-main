@@ -208,6 +208,7 @@ def bin_binary_batch(
 # DiffPIR core (identical to batch_inference.py)
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
 def spad_data_step_binomial(
     x0_pred: torch.Tensor,
     bin_counts: torch.Tensor,
@@ -222,59 +223,88 @@ def spad_data_step_binomial(
     t_total: float = 1.0,
     x_param: str = "log",
 ):
+    """
+    Solve the data sub-problem with analytical gradients (no autograd).
+
+    Supports x_param='log' (phi = exp(x)) and x_param='log1p' (phi = expm1(x)).
+    The gradient of the total loss w.r.t. x is derived in closed form:
+
+      d(NLL)/dx_k  = [-c_k * exp(-N_k) / p_k + (m_k - c_k)] * s * dphi/dx
+      d(count)/dx_k = 2w * (integral - N_obs) / (N_obs+eps) * dt * dphi/dx
+      d(prox)/dx_k  = rho * (x_k - x0_k)
+
+    where dphi/dx = phi for 'log' and dphi/dx = phi + 1 for 'log1p'.
+    """
     batch_size = x0_pred.shape[0]
     seq_len = x0_pred.shape[2]
-    x = x0_pred.clone().detach().clamp(-10, 15).requires_grad_(True)
+    x = x0_pred.clone().clamp(-10, 15)  # [B, 1, seq_len]
 
     ppp_scale_t = torch.as_tensor(ppp_scale, device=x.device, dtype=x.dtype)
     if ppp_scale_t.ndim == 0:
-        ppp_scale_t = ppp_scale_t.expand(batch_size).unsqueeze(1)
+        ppp_scale_t = ppp_scale_t.expand(batch_size).unsqueeze(1)  # [B, 1]
     elif ppp_scale_t.ndim == 1:
-        ppp_scale_t = ppp_scale_t.unsqueeze(1)
+        ppp_scale_t = ppp_scale_t.unsqueeze(1)  # [B, 1]
 
     dt = t_total / seq_len
-    total_det = bin_counts.sum(-1)
-    total_frm = bin_sizes.sum(-1)
+    total_det = bin_counts.sum(-1)                                         # [B]
+    total_frm = bin_sizes.sum(-1)                                          # [B]
     det_rate = torch.clamp(total_det / (total_frm + 1e-8), 1e-8, 1 - 1e-3)
     N_per_frame = -torch.log(1 - det_rate)
     mean_flux_target = torch.clamp(
         (N_per_frame - dark_count) / (ppp_scale_t.squeeze(1) + 1e-10), min=1.0
     )
-    N_obs = mean_flux_target * t_total
+    N_obs = mean_flux_target * t_total                                     # [B]
 
     for _ in range(n_iter):
-        phi = flux_from_x(x, x_param=x_param).squeeze(1)
+        # --- forward quantities ---
+        x_sq = x.squeeze(1)                   # [B, seq_len]
+        if x_param == "log":
+            phi = torch.exp(x_sq)             # phi = exp(x)
+            dphi_dx = phi                     # d(phi)/d(x) = phi
+        elif x_param == "log1p":
+            phi = torch.expm1(x_sq)           # phi = exp(x) - 1
+            dphi_dx = phi + 1.0               # d(phi)/d(x) = exp(x)
+        else:
+            phi = torch.exp(x_sq)
+            dphi_dx = phi
         phi = torch.clamp(phi, min=0.0)
 
-        N_k = ppp_scale_t * phi + dark_count
-        p_k = torch.clamp(1.0 - torch.exp(-N_k), 1e-8, 1 - 1e-8)
+        N_k = ppp_scale_t * phi + dark_count                   # [B, seq_len]
+        exp_neg_Nk = torch.exp(-N_k)
+        p_k = torch.clamp(1.0 - exp_neg_Nk, 1e-8, 1 - 1e-8)  # [B, seq_len]
 
-        nll_per = -(bin_counts * torch.log(p_k)
-                    + (bin_sizes - bin_counts) * torch.log(1 - p_k)).sum(-1)
+        # --- analytical NLL gradient ---
+        # d(NLL)/d(phi_k) = [-c_k * exp(-N_k) / p_k + (m_k - c_k)] * s
+        grad_nll_phi = (-bin_counts * exp_neg_Nk / p_k
+                        + (bin_sizes - bin_counts)) * ppp_scale_t  # [B, seq_len]
+        grad_nll_x = grad_nll_phi * dphi_dx                       # [B, seq_len]
 
-        flux_integral = (phi * dt).sum(-1)
-        count_penalty_per = total_count_weight * (
-            (flux_integral - N_obs) ** 2 / (N_obs + 1e-8)
-        )
+        # --- analytical count-penalty gradient ---
+        flux_integral = (phi * dt).sum(-1)                         # [B]
+        residual = flux_integral - N_obs                           # [B]
+        grad_count_x = (
+            total_count_weight * 2.0 * residual / (N_obs + 1e-8)  # [B]
+        ).unsqueeze(1) * dt * dphi_dx                              # [B, seq_len]
 
-        prox_per = 0.5 * rho_t * ((x - x0_pred) ** 2).sum(dim=[1, 2])
-        total_loss = (nll_per + count_penalty_per + prox_per).sum()
+        # --- proximal gradient ---
+        grad_prox_x = rho_t * (x_sq - x0_pred.squeeze(1))         # [B, seq_len]
 
-        grad = torch.autograd.grad(total_loss, x)[0]
+        grad = (grad_nll_x + grad_count_x + grad_prox_x).unsqueeze(1)  # [B, 1, seq_len]
         grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
-        with torch.no_grad():
-            L_nll_per = (bin_sizes * (ppp_scale_t * phi) ** 2
-                         * torch.exp(-N_k)).max(dim=-1).values
-            L_nll_per = torch.nan_to_num(L_nll_per, nan=0.0, posinf=1e6, neginf=0.0)
-            step = lr_scale / (L_nll_per + rho_t + 1e-8)
-            step = step.view(batch_size, 1, 1)
-            x = (x - step * grad).clamp(-10, 10)
-        x = x.detach().requires_grad_(True)
+        # --- adaptive step size (Lipschitz) ---
+        L_nll_per = (bin_sizes * (ppp_scale_t * phi) ** 2
+                     * exp_neg_Nk).max(dim=-1).values              # [B]
+        L_nll_per = torch.nan_to_num(L_nll_per, nan=0.0, posinf=1e6, neginf=0.0)
+        step = lr_scale / (L_nll_per + rho_t + 1e-8)              # [B]
+        step = step.view(batch_size, 1, 1)                         # [B, 1, 1]
 
-    return x.detach()
+        x = (x - step * grad).clamp(-10, 10)
+
+    return x
 
 
+@torch.no_grad()
 def sample_diffpir_photon_flux(
     *,
     model,
@@ -294,6 +324,7 @@ def sample_diffpir_photon_flux(
     sequence_length: int,
     device: torch.device,
     show_progress: bool = False,
+    use_amp: bool = False,
 ) -> torch.Tensor:
     batch_size = bin_counts.shape[0]
     shape = (batch_size, 1, sequence_length)
@@ -301,10 +332,6 @@ def sample_diffpir_photon_flux(
     x_t = torch.randn(shape, device=device)
 
     alphas_cumprod = torch.from_numpy(diffusion.alphas_cumprod).to(device)
-    sqrt_alphas_cumprod = torch.from_numpy(diffusion.sqrt_alphas_cumprod).to(device)
-    sqrt_one_minus_alphas_cumprod = torch.from_numpy(
-        diffusion.sqrt_one_minus_alphas_cumprod
-    ).to(device)
 
     timesteps = np.linspace(diffusion_steps - 1, 0, num_steps, dtype=int)
 
@@ -317,18 +344,24 @@ def sample_diffpir_photon_flux(
     for step_idx, t in iterator:
         t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
 
-        with torch.no_grad():
+        # --- Step 1: model prediction (optionally in fp16/bf16) ---
+        if use_amp and device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                model_output = model(x_t, t_tensor)
+            model_output = model_output.float()
+        else:
             model_output = model(x_t, t_tensor)
-            model_output = torch.nan_to_num(model_output, nan=0.0, posinf=0.0, neginf=0.0)
+        model_output = torch.nan_to_num(model_output, nan=0.0, posinf=0.0, neginf=0.0)
 
-            alpha_bar_t = alphas_cumprod[t]
-            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+        alpha_bar_t = alphas_cumprod[t]
+        sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
 
-            x0_pred = (x_t - sqrt_one_minus_alpha_bar_t * model_output) / sqrt_alpha_bar_t
-            x0_pred = torch.nan_to_num(x0_pred, nan=0.0, posinf=15.0, neginf=-10.0)
-            x0_pred = x0_pred.clamp(-10, 15)
+        x0_pred = (x_t - sqrt_one_minus_alpha_bar_t * model_output) / sqrt_alpha_bar_t
+        x0_pred = torch.nan_to_num(x0_pred, nan=0.0, posinf=15.0, neginf=-10.0)
+        x0_pred = x0_pred.clamp(-10, 15)
 
+        # --- Step 2: data sub-problem (analytical gradient, no autograd) ---
         sigma_k_t = sqrt_one_minus_alpha_bar_t / (sqrt_alpha_bar_t + 1e-8)
         rho_t = lambda_data / (sigma_k_t ** 2 + 1e-8)
 
@@ -340,6 +373,7 @@ def sample_diffpir_photon_flux(
         )
         x0_hat = torch.nan_to_num(x0_hat, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10, 15)
 
+        # --- Step 3: DDIM update ---
         if step_idx < len(timesteps) - 1:
             t_prev = timesteps[step_idx + 1]
             alpha_bar_t_prev = alphas_cumprod[t_prev]
@@ -467,6 +501,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fps", type=int, default=30, help="Output video frame rate")
 
+    # Performance
+    ap.add_argument("--use_amp", action="store_true",
+                     help="Use automatic mixed precision (fp16) for the model forward pass")
+    ap.add_argument("--compile_model", action="store_true",
+                     help="Use torch.compile() on the model (requires PyTorch 2.0+)")
+
     args = ap.parse_args()
     maybe_add_to_syspath(args.improved_diffusion_root)
     set_seed(args.seed)
@@ -527,6 +567,12 @@ def main() -> None:
         diffusion_steps=args.diffusion_steps,
         device=device,
     )
+    if args.compile_model:
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile()")
+        except Exception as e:
+            print(f"torch.compile() not available ({e}), continuing without it.")
 
     # ------------------------------------------------------------------
     # 3.  Simulate SPAD & bin  (all pixels)
@@ -563,34 +609,34 @@ def main() -> None:
     log_flux_hat = np.empty((num_pixels, seq_len), dtype=np.float32)
 
     batches = list(chunked_indices(num_pixels, args.infer_batch_size))
-    with torch.set_grad_enabled(True):
-        for batch_idx, sl in enumerate(tqdm(batches, desc="Inference")):
-            bc = torch.from_numpy(bin_counts_all[sl]).to(device)
-            bs_tensor = torch.from_numpy(
-                np.broadcast_to(bin_sizes_np[None, :], (bc.shape[0], seq_len)).copy()
-            ).to(device)
-            ppp_s = torch.from_numpy(ppp_scales_all[sl]).to(device)
+    for batch_idx, sl in enumerate(tqdm(batches, desc="Inference")):
+        bc = torch.from_numpy(bin_counts_all[sl]).to(device)
+        bs_tensor = torch.from_numpy(
+            np.broadcast_to(bin_sizes_np[None, :], (bc.shape[0], seq_len)).copy()
+        ).to(device)
+        ppp_s = torch.from_numpy(ppp_scales_all[sl]).to(device)
 
-            x_hat = sample_diffpir_photon_flux(
-                model=model,
-                diffusion=diffusion,
-                bin_counts=bc,
-                bin_sizes=bs_tensor,
-                ppp_scale=ppp_s,
-                dark_count=float(args.dark_count),
-                num_steps=int(args.sampling_steps),
-                diffusion_steps=int(args.diffusion_steps),
-                lambda_data=float(args.lambda_data),
-                eta=float(args.eta),
-                pp_solver_iters=int(args.pp_solver_iters),
-                pp_lr_scale=float(args.pp_lr_scale),
-                t_total=float(args.t_total),
-                x_param=str(args.x_param),
-                sequence_length=seq_len,
-                device=device,
-                show_progress=(batch_idx == 0),  # progress bar for the first batch only
-            )
-            log_flux_hat[sl] = x_hat[:, 0, :].detach().cpu().numpy().astype(np.float32)
+        x_hat = sample_diffpir_photon_flux(
+            model=model,
+            diffusion=diffusion,
+            bin_counts=bc,
+            bin_sizes=bs_tensor,
+            ppp_scale=ppp_s,
+            dark_count=float(args.dark_count),
+            num_steps=int(args.sampling_steps),
+            diffusion_steps=int(args.diffusion_steps),
+            lambda_data=float(args.lambda_data),
+            eta=float(args.eta),
+            pp_solver_iters=int(args.pp_solver_iters),
+            pp_lr_scale=float(args.pp_lr_scale),
+            t_total=float(args.t_total),
+            x_param=str(args.x_param),
+            sequence_length=seq_len,
+            device=device,
+            show_progress=(batch_idx == 0),
+            use_amp=bool(args.use_amp),
+        )
+        log_flux_hat[sl] = x_hat[:, 0, :].cpu().numpy().astype(np.float32)
 
     # ------------------------------------------------------------------
     # 5.  Convert recovered log-flux → linear flux → video frames
