@@ -642,6 +642,7 @@ def main() -> None:
     print(f"x(flux) range: [{log_flux_sel.min():.2f}, {log_flux_sel.max():.2f}]")
 
     target_ppps = parse_ppp_list(args.target_ppp)
+    all_ppp_results: List[Dict] = []  # collect results for consolidated log
     for ppp in target_ppps:
         print(f"\n=== PPP={ppp} | frames={args.n_spad_frames} | samples={args.num_samples} ===")
 
@@ -758,42 +759,64 @@ def main() -> None:
             avg_Correlation=agg["Correlation"],
         )
 
-        # Write human-readable + machine-parseable log file.
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "config": {
-                "dataset": args.dataset,
-                "checkpoint": args.checkpoint,
-                "num_samples": args.num_samples,
-                "seed": args.seed,
-                "ppp": ppp,
-                "n_spad_frames": args.n_spad_frames,
-                "sequence_length": args.sequence_length,
-                "diffusion_steps": args.diffusion_steps,
-                "sampling_steps": args.sampling_steps,
-                "lambda_data": args.lambda_data,
-                "eta": args.eta,
-                "pp_solver_iters": args.pp_solver_iters,
-                "pp_lr_scale": args.pp_lr_scale,
-                "t_total": args.t_total,
-                "dark_count": args.dark_count,
-                "x_param": args.x_param,
-                "normalize_flux": args.normalize_flux,
-                "flux_peak": args.flux_peak,
-                "num_channels": args.num_channels,
-                "infer_batch_size": args.infer_batch_size,
-            },
-            "results": {
-                "n_valid": n_valid,
-                "n_total": args.num_samples,
-                "n_dropped": args.num_samples - n_valid,
-                "avg_metrics": agg,
-            },
+        # Per-PPP JSON log.
+        ppp_entry = {
+            "ppp": ppp,
+            "n_valid": n_valid,
+            "n_total": args.num_samples,
+            "n_dropped": args.num_samples - n_valid,
+            "avg_metrics": agg,
         }
+        all_ppp_results.append(ppp_entry)
+
         log_path = os.path.join(args.output_dir, f"metrics_{tag}.json")
         with open(log_path, "w") as f:
-            json.dump(log_entry, f, indent=2)
+            json.dump({"timestamp": datetime.now().isoformat(),
+                        "config": vars(args), "results": ppp_entry}, f, indent=2)
         print(f"Log saved to {log_path}")
+
+    # ------------------------------------------------------------------
+    # Consolidated log: all PPP levels in one file.
+    # ------------------------------------------------------------------
+    consolidated = {
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "dataset": args.dataset,
+            "checkpoint": args.checkpoint,
+            "num_samples": args.num_samples,
+            "seed": args.seed,
+            "n_spad_frames": args.n_spad_frames,
+            "sequence_length": args.sequence_length,
+            "diffusion_steps": args.diffusion_steps,
+            "sampling_steps": args.sampling_steps,
+            "lambda_data": args.lambda_data,
+            "eta": args.eta,
+            "pp_solver_iters": args.pp_solver_iters,
+            "pp_lr_scale": args.pp_lr_scale,
+            "t_total": args.t_total,
+            "dark_count": args.dark_count,
+            "x_param": args.x_param,
+            "normalize_flux": args.normalize_flux,
+            "flux_peak": args.flux_peak,
+            "num_channels": args.num_channels,
+            "infer_batch_size": args.infer_batch_size,
+        },
+        "results": all_ppp_results,
+    }
+    consolidated_path = os.path.join(args.output_dir, "metrics_all.json")
+    with open(consolidated_path, "w") as f:
+        json.dump(consolidated, f, indent=2)
+
+    # Print summary table.
+    print(f"\n{'=' * 70}")
+    print(f"{'PPP':>8s} | {'MSE':>14s} | {'Rel MSE':>12s} | {'MAE':>12s} | {'Rel MAE':>12s} | {'Corr':>10s}")
+    print(f"{'-' * 70}")
+    for entry in all_ppp_results:
+        m = entry["avg_metrics"]
+        print(f"{entry['ppp']:8g} | {m['MSE']:14.6f} | {m['Relative MSE']:12.6f} | "
+              f"{m['MAE']:12.6f} | {m['Relative MAE']:12.6f} | {m['Correlation']:10.6f}")
+    print(f"{'=' * 70}")
+    print(f"Consolidated log saved to {consolidated_path}")
 
 
 if __name__ == "__main__":
