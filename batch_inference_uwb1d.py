@@ -1,24 +1,24 @@
 """
-Batch inference for 1D temporal photon flux estimation with UWB (1D NUFFT + CFAR).
+Batch inference for 1D temporal photon flux estimation with UWB (uwb1d_quanta).
 
 What this script does:
 - Loads a `log_flux_dataset.pt` tensor of shape [N, L] (log(flux) samples).
 - Randomly samples `--num_samples` items.
 - For each TARGET_PPP level:
-  - Simulates SPAD binary detections with `--n_spad_frames` frames.
-  - Converts binary detections to arrival timestamps.
-  - Runs UWB 1D reconstruction (NUFFT + CFAR thresholding + inverse NUFFT).
-  - Inverts the SPAD forward model to recover flux from the estimated rate.
-  - Computes metrics, dropping any sample with any NaN/inf metric entry.
-  - Saves detections + reconstructions + per-sample metrics.
+  - Simulates SPAD binary detections using the physical model
+    (flux scaled so mean(φ)*dt_frame = target_ppp).
+  - Runs UWB 1D reconstruction via ihpp_fft.uwb1d_quanta on binary frames.
+  - Computes metrics between the UWB output and the physically-rescaled
+    ground-truth flux (flux_gt), matching the notebook convention.
+  - Saves downsampled reconstructions + per-sample metrics.
+- Writes a consolidated metrics_all.json after all PPP levels.
 
-python batch_inference_uwb1d.py \
-  --dataset "./data/step_log_flux_dataset.pt" \
-  --output_dir "./outputs/batch_uwb1d_01" \
-  --num_samples 2000 \
-  --target_ppp "0.1" \
-  --n_spad_frames 100000 \
-  --save_binary
+python batch_inference_uwb1d.py \\
+  --dataset "./data/step_log_flux_dataset.pt" \\
+  --output_dir "./outputs/batch_uwb1d_01" \\
+  --num_samples 2000 \\
+  --target_ppp "0.01,0.05,0.1,0.5,1.0" \\
+  --n_spad_frames 100000
 """
 
 from __future__ import annotations
@@ -88,175 +88,94 @@ def maybe_add_to_syspath(path: Optional[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SPAD simulation (identical to batch_inference.py)
+# SPAD simulation — physical parameterization (matches updated notebook)
 # ---------------------------------------------------------------------------
 
-def generate_photon_arrivals_spad(
+def generate_photon_arrivals_spad_physical(
     flux,
     target_ppp: float = 1.0,
-    d: float = 7.74e-4,
+    d: float = 0.0,
     T: float = 1.0,
-    return_binary=False,
-    return_flux_scaled=False,
     seq_length=None,
+    return_binary: bool = False,
 ):
     """
-    Generate photon arrivals using SPAD-style Poisson sampling.
+    Physical SPAD model: scale flux so mean(φ) * dt_frame = target_ppp.
 
-    1. Scale flux to achieve target average photons per pixel (PPP).
-    2. Apply Poisson sampling: Pr{detection} = 1 - exp(-N(t)).
-    3. Convert binary detections to arrival times.
+    Returns:
+        arrivals: photon arrival times (seconds)
+        flux_gt: rescaled ground-truth flux (photons/sec) at seq_length resolution
+        (optional) binary: [seq_length] binary detection array
     """
     flux = np.asarray(flux, dtype=np.float64).ravel()
     n_src = len(flux)
     if seq_length is None:
         seq_length = n_src
-    elif seq_length != n_src:
-        t_src = np.linspace(0.0, T, n_src)
-        t_dst = np.linspace(0.0, T, seq_length)
+
+    dt_frame = T / seq_length
+
+    # Interpolate flux onto frame grid if needed.
+    if seq_length != n_src:
+        t_src = np.linspace(0, T, n_src)
+        t_dst = np.linspace(0, T, seq_length)
         flux = np.interp(t_dst, t_src, flux)
 
-    flux_normalized = flux.copy()
-    if flux_normalized.max() > 1.0:
-        flux_normalized = flux_normalized / flux_normalized.max()
+    # Scale flux so that mean(φ) * dt_frame = target_ppp.
+    flux_mean = flux.mean()
+    if flux_mean > 0:
+        flux_gt = flux * (target_ppp / (flux_mean * dt_frame))
+    else:
+        flux_gt = flux.copy()
 
-    I_mean = flux_normalized.mean()
-    a = target_ppp / I_mean if I_mean > 0 else 1.0
+    # Physical expected photons per frame: N(t) = φ(t) * dt + d.
+    N_t = flux_gt * dt_frame  # mean(N_t) = target_ppp by construction
 
-    flux_scaled = a * flux_normalized + d
-    detection_prob = 1.0 - np.exp(-flux_scaled)
+    # SPAD detection model.
+    detection_prob = 1.0 - np.exp(-(N_t + d))
     binary = (np.random.random(seq_length) < detection_prob).astype(np.uint8)
 
+    # Arrival times.
     detection_indices = np.where(binary == 1)[0]
     dt = T / (seq_length - 1) if seq_length > 1 else T
     arrivals = detection_indices * dt
 
-    result = [arrivals]
+    result = [arrivals, flux_gt]
     if return_binary:
         result.append(binary)
-    if return_flux_scaled:
-        result.append(flux_scaled)
-    return result[0] if len(result) == 1 else tuple(result)
-
-
-def compute_ppp_scale_for_flux(flux: np.ndarray, target_ppp: float) -> float:
-    """
-    Reproduces the mapping implied by SPAD generation:
-      flux_normalized = flux / flux_max
-      a = target_ppp / mean(flux_normalized)
-      ppp_scale = a / flux_max
-    """
-    flux = np.asarray(flux, dtype=np.float64).ravel()
-    flux_max = float(np.max(flux)) if flux.size else 1.0
-    if not np.isfinite(flux_max) or flux_max <= 0:
-        flux_max = 1.0
-    flux_normalized = flux / flux_max
-    I_mean = float(np.mean(flux_normalized)) if flux_normalized.size else 0.0
-    if not np.isfinite(I_mean) or I_mean <= 0:
-        I_mean = 1.0
-    a_scale = float(target_ppp) / I_mean
-    return float(a_scale / flux_max)
+    return tuple(result)
 
 
 # ---------------------------------------------------------------------------
-# UWB 1D reconstruction
+# Metrics
 # ---------------------------------------------------------------------------
 
-def simple_ihpp_uwb1d(
-    stamps,
-    T_exp: float = 1.0,
-    freqs=(0, 5000, 1),
-    cfarscale: float = 2.0,
-    percentage_in: float = 0.99,
-    target_len: int = 1024,
-    verbose: bool = False,
-):
+def compute_metrics(
+    flux_true: np.ndarray,
+    flux_pred: np.ndarray,
+    T_exp: Optional[float] = None,
+) -> Metrics:
     """
-    Minimal 1D UWB via NUFFT -> CFAR threshold -> inverse NUFFT.
-
-    Args:
-        stamps: 1D array of arrival timestamps (seconds).
-        T_exp: total duration of the trace (seconds).
-        freqs: (start, stop, step) tuple for probing frequencies.
-        cfarscale: scales the CFAR amplitude bound.
-        percentage_in: percentage of true frequencies to keep in bound calc.
-        target_len: length of reconstructed time grid.
-        verbose: pass-through to uwb_utils functions.
-
-    Returns:
-        recon: time-domain reconstruction (len=target_len)
-        F: raw NUFFT coefficients
-        F_thresh: thresholded coefficients
-        probed_freqs: frequency grid
-        bound: amplitude threshold used
+    Reconstruction metrics.  If lengths differ, resample flux_pred onto the
+    ground-truth time grid (matching the notebook convention).
     """
-    from uwb3d import uwb_utils
+    flux_true = np.asarray(flux_true, dtype=np.float64).ravel()
+    flux_pred = np.asarray(flux_pred, dtype=np.float64).ravel()
 
-    stamps = np.asarray(stamps, dtype=np.float64).ravel()
-    if stamps.size == 0:
-        return (
-            np.zeros(target_len),
-            np.array([]),
-            np.array([]),
-            np.array([]),
-            np.nan,
-        )
+    if flux_true.shape != flux_pred.shape:
+        if T_exp is None:
+            raise ValueError(
+                "flux_true and flux_pred have different lengths; pass T_exp to resample."
+            )
+        t_gt = np.linspace(0, T_exp, len(flux_true))
+        t_pr = np.linspace(0, T_exp, len(flux_pred))
+        flux_pred = np.interp(t_gt, t_pr, flux_pred)
 
-    stamps = np.clip(stamps - stamps.min(), 0.0, T_exp)
-
-    F, probed_freqs = uwb_utils.probe_frequencies_sweep(
-        stamps=stamps,
-        time_total=T_exp,
-        freqs=freqs,
-        return_freqs=True,
-        verbose=verbose,
-    )
-    amplitudes = np.abs(F)
-    bound = uwb_utils.compute_amplitude_bound(stamps, T_exp, percentage_in) * cfarscale
-    keep_mask = amplitudes > bound
-    F_thresh = F * keep_mask
-
-    t_grid = np.linspace(0, T_exp, target_len, endpoint=False)
-    recon = uwb_utils.reconstruct_rate_function(
-        t_grid, probed_freqs, F_thresh, verbose=verbose,
-    ).real
-
-    return recon, F, F_thresh, probed_freqs, bound
-
-
-def uwb_rate_to_flux(
-    recon: np.ndarray,
-    fps: float,
-    ppp_scale: float,
-    dark_count: float = 7.74e-4,
-) -> np.ndarray:
-    """
-    Invert SPAD forward model to recover physical flux from UWB rate estimate.
-
-    The SPAD model gives:
-        detection_prob(t) = 1 - exp(-(ppp_scale * flux(t) + dark_count))
-        rate(t) = detection_prob(t) * fps
-
-    Inversion:
-        detection_prob = rate / fps
-        N = -log(1 - detection_prob)
-        flux = (N - dark_count) / ppp_scale
-    """
-    p_hat = np.clip(recon / fps, 1e-12, 1 - 1e-8)
-    N_hat = -np.log(1.0 - p_hat)
-    flux_hat = np.maximum((N_hat - dark_count) / ppp_scale, 0.0)
-    return flux_hat
-
-
-# ---------------------------------------------------------------------------
-# Metrics (identical to batch_inference.py)
-# ---------------------------------------------------------------------------
-
-def compute_metrics(flux_true: np.ndarray, flux_pred: np.ndarray) -> Metrics:
     mse = np.mean((flux_true - flux_pred) ** 2)
-    rel_mse = mse / np.mean(flux_true ** 2)
+    denom_sq = np.mean(flux_true ** 2)
+    rel_mse = mse / denom_sq if denom_sq > 0 else np.nan
     mae = np.mean(np.abs(flux_true - flux_pred))
-    rel_mae = mae / np.mean(np.abs(flux_true))
+    denom_abs = np.mean(np.abs(flux_true))
+    rel_mae = mae / denom_abs if denom_abs > 0 else np.nan
     corr = np.corrcoef(flux_true, flux_pred)[0, 1]
     return Metrics(mse=mse, rel_mse=rel_mse, mae=mae, rel_mae=rel_mae, corr=corr)
 
@@ -267,7 +186,7 @@ def is_finite_metrics(m: Metrics) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading (identical to batch_inference.py)
+# Dataset loading
 # ---------------------------------------------------------------------------
 
 def load_log_flux_dataset(path: str) -> torch.Tensor:
@@ -290,52 +209,68 @@ def sample_indices(n_total: int, n: int, seed: int) -> np.ndarray:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", type=str, required=True, help="Path to log_flux_dataset.pt (tensor [N, L])")
-    ap.add_argument("--output_dir", type=str, required=True, help="Directory to save reconstructions/metrics")
-    ap.add_argument("--uwb3d_root", type=str, default=None, help="Optional path to add to sys.path for uwb3d")
+    ap.add_argument("--dataset", type=str, required=True,
+                    help="Path to log_flux_dataset.pt (tensor [N, L])")
+    ap.add_argument("--output_dir", type=str, required=True,
+                    help="Directory to save reconstructions/metrics")
+    ap.add_argument("--uwb3d_root", type=str, default=None,
+                    help="Optional path to add to sys.path for uwb3d")
 
-    ap.add_argument("--num_samples", type=int, required=True, help="Number of random samples to run")
+    ap.add_argument("--num_samples", type=int, required=True,
+                    help="Number of random samples to run")
     ap.add_argument("--seed", type=int, default=42)
 
-    ap.add_argument("--sequence_length", type=int, default=1024)
+    ap.add_argument("--sequence_length", type=int, default=1024,
+                    help="Ground-truth flux length (from dataset)")
 
     # UWB parameters
-    ap.add_argument("--cfarscale", type=float, default=2.0, help="CFAR amplitude bound scaling factor")
-    ap.add_argument("--percentage_in", type=float, default=None,
-                    help="Percentage for CFAR bound calc (default: auto = 1 - 1/n_freqs)")
-    ap.add_argument("--freq_step", type=int, default=1, help="Step between probed frequencies")
-    ap.add_argument("--max_freq", type=float, default=None,
-                    help="Max probing frequency in Hz (default: Nyquist = n_spad_frames / (2 * t_total))")
+    ap.add_argument("--nt", type=int, default=None,
+                    help="UWB output time-grid resolution "
+                         "(default: same as --n_spad_frames, matching notebook)")
+    ap.add_argument("--cuda", action="store_true", default=True,
+                    help="Use CUDA for uwb1d_quanta (default: True)")
+    ap.add_argument("--no_cuda", action="store_true",
+                    help="Disable CUDA for uwb1d_quanta")
 
     # SPAD simulation parameters
     ap.add_argument("--t_total", type=float, default=1.0)
-    ap.add_argument("--dark_count", type=float, default=7.74e-4)
+    ap.add_argument("--dark_count", type=float, default=0.0,
+                    help="Spurious detection rate per frame (default: 0.0, matching notebook)")
     ap.add_argument("--n_spad_frames", type=int, default=100_000)
-    ap.add_argument("--target_ppp", type=str, default="0.05", help="Comma-separated, e.g. 0.05,0.01,0.005")
-    ap.add_argument("--save_binary", action="store_true", help="Also save raw binary detections [num_samples, n_spad_frames]")
+    ap.add_argument("--target_ppp", type=str, default="0.05",
+                    help="Comma-separated, e.g. 0.05,0.01,0.005")
+    ap.add_argument("--save_binary", action="store_true",
+                    help="Also save raw binary detections [num_samples, n_spad_frames]")
 
     ap.add_argument(
         "--normalize_flux",
         action="store_true",
-        default=True,
-        help="Normalize each flux sample by its max then scale to --flux_peak (default: True).",
+        default=False,
+        help="Normalize each flux sample by its max then scale to --flux_peak "
+             "(default: False, matching updated notebook).",
     )
-    ap.add_argument("--no_normalize_flux", action="store_true", help="Disable flux normalization.")
     ap.add_argument(
         "--flux_peak",
         type=float,
         default=10000.0,
-        help="Peak value after normalization (default: 10000, matching notebook).",
+        help="Peak value after normalization (only used with --normalize_flux).",
     )
 
     args = ap.parse_args()
 
-    if args.no_normalize_flux:
-        args.normalize_flux = False
+    if args.no_cuda:
+        args.cuda = False
+
+    # Nt defaults to n_spad_frames (matches notebook: Nt = 100_000 = N_SPAD_FRAMES).
+    if args.nt is None:
+        args.nt = args.n_spad_frames
 
     ensure_dir(args.output_dir)
     maybe_add_to_syspath(args.uwb3d_root)
     set_seed(args.seed)
+
+    # Lazy import — uwb3d_root may have been added to sys.path above.
+    from uwb3d import ihpp_fft  # noqa: E402
 
     # ------------------------------------------------------------------
     # Load dataset and choose samples.
@@ -345,7 +280,9 @@ def main() -> None:
         raise ValueError(f"Expected dataset with shape [N, L], got {tuple(log_flux_ds.shape)}")
     n_total, l_total = int(log_flux_ds.shape[0]), int(log_flux_ds.shape[1])
     if args.sequence_length > l_total:
-        raise ValueError(f"--sequence_length {args.sequence_length} exceeds dataset length {l_total}")
+        raise ValueError(
+            f"--sequence_length {args.sequence_length} exceeds dataset length {l_total}"
+        )
     idx = sample_indices(n_total, args.num_samples, args.seed)
     np.save(os.path.join(args.output_dir, "sample_indices.npy"), idx.astype(np.int64))
 
@@ -360,82 +297,29 @@ def main() -> None:
 
     print(f"normalize_flux: {args.normalize_flux}, flux_peak: {args.flux_peak}")
     print(f"Flux range across dataset: [{flux_sel.min():.1f}, {flux_sel.max():.1f}]")
-
-    # ------------------------------------------------------------------
-    # UWB frequency setup.
-    # ------------------------------------------------------------------
-    fps = args.n_spad_frames / args.t_total
-    max_freq = args.max_freq if args.max_freq is not None else fps / 2.0
-    freq_slice = (0, int(max_freq) + args.freq_step, args.freq_step)
-    n_freqs = len(np.arange(*freq_slice))
-
-    # Percentage_in: default to 1 - 1/n_freqs (matches notebook convention).
-    pct_in = args.percentage_in if args.percentage_in is not None else 1.0 - 1.0 / max(1, n_freqs)
-
-    print(f"fps: {fps:.1f}")
-    print(f"Frequency range: (0, {int(max_freq) + args.freq_step}, {args.freq_step})  "
-          f"({n_freqs} frequencies)")
-    print(f"CFAR scale: {args.cfarscale}, percentage_in: {pct_in:.8f}")
+    print(f"Nt (UWB output resolution): {args.nt}")
+    print(f"CUDA: {args.cuda}")
 
     # ------------------------------------------------------------------
     # Loop over PPP levels.
     # ------------------------------------------------------------------
     target_ppps = parse_ppp_list(args.target_ppp)
     all_ppp_results: List[Dict] = []  # collect results for consolidated log
+
     for ppp in target_ppps:
         print(f"\n=== PPP={ppp} | frames={args.n_spad_frames} | samples={args.num_samples} ===")
 
-        # 1) Generate SPAD binary detections and extract arrival timestamps.
-        binary_all: Optional[np.ndarray] = None
-        if args.save_binary:
-            binary_all = np.zeros((args.num_samples, args.n_spad_frames), dtype=np.uint8)
-        ppp_scales = np.zeros((args.num_samples,), dtype=np.float32)
-        all_stamps: List[np.ndarray] = []
+        tag = (f"ppp{ppp:g}_frames{args.n_spad_frames}"
+               f"_len{args.sequence_length}_n{args.num_samples}")
 
-        for i in tqdm(range(args.num_samples), desc="Simulating SPAD", total=args.num_samples):
-            flux_i = flux_sel[i]
-            ppp_scales[i] = compute_ppp_scale_for_flux(flux_i, float(ppp))
-            arrivals_i, binary_i = generate_photon_arrivals_spad(
-                flux_i,
-                target_ppp=float(ppp),
-                d=float(args.dark_count),
-                T=float(args.t_total),
-                seq_length=int(args.n_spad_frames),
-                return_binary=True,
-            )
-            if binary_all is not None:
-                binary_all[i] = binary_i
-            all_stamps.append(arrivals_i)
+        # Downsampled arrays for storage (at sequence_length resolution).
+        recon_ds_all = np.zeros(
+            (args.num_samples, args.sequence_length), dtype=np.float32
+        )
+        flux_gt_ds_all = np.zeros(
+            (args.num_samples, args.sequence_length), dtype=np.float32
+        )
 
-        # Save detections.
-        tag = f"ppp{ppp:g}_frames{args.n_spad_frames}_len{args.sequence_length}_n{args.num_samples}"
-        np.save(os.path.join(args.output_dir, f"ppp_scale_{tag}.npy"), ppp_scales.astype(np.float32))
-        if binary_all is not None:
-            np.save(os.path.join(args.output_dir, f"binary_{tag}.npy"), binary_all)
-
-        # 2) Run UWB 1D inference.
-        #    The raw UWB output is a rate estimate (events/sec), NOT physical flux.
-        #    Matching the notebook, metrics are computed on raw rate vs. flux_true
-        #    (no SPAD model inversion).
-        recon_rate_all = np.zeros((args.num_samples, args.sequence_length), dtype=np.float64)
-
-        for i in tqdm(range(args.num_samples), desc="UWB Inference", total=args.num_samples):
-            recon, _, _, _, _ = simple_ihpp_uwb1d(
-                stamps=all_stamps[i],
-                T_exp=args.t_total,
-                freqs=freq_slice,
-                cfarscale=args.cfarscale,
-                percentage_in=pct_in,
-                target_len=args.sequence_length,
-                verbose=False,
-            )
-            recon_rate_all[i] = recon
-
-        np.save(os.path.join(args.output_dir, f"recon_rate_{tag}.npy"), recon_rate_all.astype(np.float32))
-
-        # 3) Metrics (drop any sample with any NaN/inf metric).
-        #    Compare raw UWB rate output directly to flux_true (no inversion),
-        #    matching the notebook: compute_metrics(flux_true, rate_uwb).
         per_sample: Dict[str, np.ndarray] = {
             "MSE": np.full((args.num_samples,), np.nan, dtype=np.float64),
             "Relative MSE": np.full((args.num_samples,), np.nan, dtype=np.float64),
@@ -445,23 +329,84 @@ def main() -> None:
             "valid": np.zeros((args.num_samples,), dtype=np.bool_),
         }
 
-        for i in range(args.num_samples):
-            flux_true_i = flux_sel[i].astype(np.float64)
-            rate_hat_i = recon_rate_all[i].astype(np.float64)
-            m = compute_metrics(flux_true_i, rate_hat_i)
-            if not is_finite_metrics(m):
-                continue
-            d = m.as_dict()
-            for k in ["MSE", "Relative MSE", "MAE", "Relative MAE", "Correlation"]:
-                per_sample[k][i] = d[k]
-            per_sample["valid"][i] = True
+        # Optional full-resolution binary storage.
+        binary_all: Optional[np.ndarray] = None
+        if args.save_binary:
+            binary_all = np.zeros(
+                (args.num_samples, args.n_spad_frames), dtype=np.uint8
+            )
 
+        # ---- Per-sample: SPAD simulation → UWB inference → metrics ----
+        for i in tqdm(range(args.num_samples), desc="SPAD + UWB",
+                      total=args.num_samples):
+            flux_i = flux_sel[i]
+
+            # 1) Physical SPAD simulation.
+            result_i = generate_photon_arrivals_spad_physical(
+                flux_i,
+                target_ppp=float(ppp),
+                d=float(args.dark_count),
+                T=float(args.t_total),
+                seq_length=int(args.n_spad_frames),
+                return_binary=True,
+            )
+            _arrivals_i, flux_gt_i, binary_i = result_i
+
+            if binary_all is not None:
+                binary_all[i] = binary_i
+
+            # 2) UWB reconstruction on binary frames.
+            frames_1d = binary_i.reshape(-1, 1, 1)
+            recon = ihpp_fft.uwb1d_quanta(
+                frames_1d,
+                T_exp=float(args.t_total),
+                Nt=int(args.nt),
+                cuda=args.cuda,
+                load_frames_on_vram=True,
+                load_output_on_vram=True,
+            )
+            recon = np.asarray(np.squeeze(recon), dtype=np.float64).ravel()
+
+            # 3) Metrics at full resolution (matching notebook).
+            m = compute_metrics(flux_gt_i, recon, T_exp=float(args.t_total))
+            if is_finite_metrics(m):
+                d_m = m.as_dict()
+                for k in ["MSE", "Relative MSE", "MAE", "Relative MAE",
+                           "Correlation"]:
+                    per_sample[k][i] = d_m[k]
+                per_sample["valid"][i] = True
+
+            # 4) Downsample for storage.
+            t_ds = np.linspace(0, args.t_total, args.sequence_length)
+            t_gt = np.linspace(0, args.t_total, len(flux_gt_i))
+            t_rc = np.linspace(0, args.t_total, len(recon))
+            flux_gt_ds_all[i] = np.interp(t_ds, t_gt, flux_gt_i).astype(
+                np.float32
+            )
+            recon_ds_all[i] = np.interp(t_ds, t_rc, recon).astype(np.float32)
+
+        # ---- Save arrays ----
+        np.save(
+            os.path.join(args.output_dir, f"recon_rate_{tag}.npy"),
+            recon_ds_all,
+        )
+        np.save(
+            os.path.join(args.output_dir, f"flux_gt_{tag}.npy"),
+            flux_gt_ds_all,
+        )
+        if binary_all is not None:
+            np.save(
+                os.path.join(args.output_dir, f"binary_{tag}.npy"), binary_all
+            )
+
+        # ---- Aggregate metrics ----
         valid_mask = per_sample["valid"]
         n_valid = int(valid_mask.sum())
-        print(f"Valid metric samples: {n_valid}/{args.num_samples} "
-              f"(dropped {args.num_samples - n_valid})")
+        print(
+            f"Valid metric samples: {n_valid}/{args.num_samples} "
+            f"(dropped {args.num_samples - n_valid})"
+        )
 
-        # Aggregate over valid only.
         agg: Dict[str, float] = {}
         for k in ["MSE", "Relative MSE", "MAE", "Relative MAE", "Correlation"]:
             vals = per_sample[k][valid_mask]
@@ -493,8 +438,15 @@ def main() -> None:
 
         log_path = os.path.join(args.output_dir, f"metrics_{tag}.json")
         with open(log_path, "w") as f:
-            json.dump({"timestamp": datetime.now().isoformat(),
-                        "config": vars(args), "results": ppp_entry}, f, indent=2)
+            json.dump(
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "config": vars(args),
+                    "results": ppp_entry,
+                },
+                f,
+                indent=2,
+            )
         print(f"Log saved to {log_path}")
 
     # ------------------------------------------------------------------
@@ -508,13 +460,12 @@ def main() -> None:
             "seed": args.seed,
             "sequence_length": args.sequence_length,
             "n_spad_frames": args.n_spad_frames,
+            "nt": args.nt,
             "t_total": args.t_total,
             "dark_count": args.dark_count,
-            "cfarscale": args.cfarscale,
-            "freq_step": args.freq_step,
-            "max_freq": args.max_freq,
             "normalize_flux": args.normalize_flux,
             "flux_peak": args.flux_peak,
+            "cuda": args.cuda,
         },
         "results": all_ppp_results,
     }
@@ -524,12 +475,18 @@ def main() -> None:
 
     # Print summary table.
     print(f"\n{'=' * 70}")
-    print(f"{'PPP':>8s} | {'MSE':>14s} | {'Rel MSE':>12s} | {'MAE':>12s} | {'Rel MAE':>12s} | {'Corr':>10s}")
+    print(
+        f"{'PPP':>8s} | {'MSE':>14s} | {'Rel MSE':>12s} | "
+        f"{'MAE':>12s} | {'Rel MAE':>12s} | {'Corr':>10s}"
+    )
     print(f"{'-' * 70}")
     for entry in all_ppp_results:
         m = entry["avg_metrics"]
-        print(f"{entry['ppp']:8g} | {m['MSE']:14.6f} | {m['Relative MSE']:12.6f} | "
-              f"{m['MAE']:12.6f} | {m['Relative MAE']:12.6f} | {m['Correlation']:10.6f}")
+        print(
+            f"{entry['ppp']:8g} | {m['MSE']:14.6f} | "
+            f"{m['Relative MSE']:12.6f} | {m['MAE']:12.6f} | "
+            f"{m['Relative MAE']:12.6f} | {m['Correlation']:10.6f}"
+        )
     print(f"{'=' * 70}")
     print(f"Consolidated log saved to {consolidated_path}")
 
