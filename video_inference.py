@@ -485,24 +485,27 @@ def main() -> None:
         raise ValueError(f"Expected shape [T, H, W], got {tuple(raw.shape)}")
 
     T_vid, H, W = raw.shape
+    seq_len = args.sequence_length
     num_pixels = H * W
     print(f"Input  : {args.input}  shape=({T_vid}, {H}, {W})  pixels={num_pixels}")
 
     # The model operates on sequences of length `sequence_length`.
-    # If T_vid != sequence_length we linearly interpolate each pixel's
-    # temporal signal to sequence_length for inference, then interpolate
-    # the result back to T_vid for the output video.
-    seq_len = args.sequence_length
-    need_temporal_interp = (T_vid != seq_len)
-    if need_temporal_interp:
-        print(f"Note   : T={T_vid} != sequence_length={seq_len}; "
-              f"will interpolate temporally for inference, then back to T={T_vid}.")
+    # T must be >= sequence_length; we take the first sequence_length frames.
+    if T_vid < seq_len:
+        raise ValueError(
+            f"Temporal dimension T={T_vid} is shorter than "
+            f"sequence_length={seq_len}. Cannot proceed."
+        )
+    if T_vid > seq_len:
+        print(f"Note   : T={T_vid} > sequence_length={seq_len}; "
+              f"using first {seq_len} frames only.")
+        raw = raw[:seq_len]  # [seq_len, H, W]
 
-    # Reshape to [num_pixels, T_vid].
-    log_flux_2d = raw.numpy().astype(np.float64).reshape(T_vid, -1).T  # [N, T]
+    # Reshape to [num_pixels, seq_len].
+    log_flux_2d = raw.numpy().astype(np.float64).reshape(seq_len, -1).T  # [N, seq_len]
 
     # Convert to linear flux.
-    flux_all = np.exp(log_flux_2d)  # [N, T_vid]
+    flux_all = np.exp(log_flux_2d)  # [N, seq_len]
 
     # Per-pixel normalisation to [0, flux_peak].
     if normalize_flux:
@@ -510,16 +513,7 @@ def main() -> None:
         mx = np.where(mx > 0, mx, 1.0)
         flux_all = (flux_all / mx) * float(args.flux_peak)
 
-    # If temporal interpolation is needed, resample flux to seq_len for
-    # the SPAD simulation and inference stages.
-    if need_temporal_interp:
-        t_src = np.linspace(0, 1, T_vid)
-        t_dst = np.linspace(0, 1, seq_len)
-        flux_for_infer = np.empty((num_pixels, seq_len), dtype=np.float64)
-        for i in range(num_pixels):
-            flux_for_infer[i] = np.interp(t_dst, t_src, flux_all[i])
-    else:
-        flux_for_infer = flux_all  # [N, seq_len]
+    flux_for_infer = flux_all  # [N, seq_len]
 
     print(f"Flux range (linear): [{flux_for_infer.min():.1f}, {flux_for_infer.max():.1f}]")
 
@@ -609,17 +603,8 @@ def main() -> None:
         flux_hat = np.exp(log_flux_hat.astype(np.float64))
     flux_hat = np.maximum(flux_hat, 0.0)  # [num_pixels, seq_len]
 
-    # If we interpolated to seq_len, interpolate back to T_vid.
-    if need_temporal_interp:
-        t_infer = np.linspace(0, 1, seq_len)
-        t_out   = np.linspace(0, 1, T_vid)
-        flux_hat_full = np.empty((num_pixels, T_vid), dtype=np.float64)
-        for i in range(num_pixels):
-            flux_hat_full[i] = np.interp(t_out, t_infer, flux_hat[i])
-        flux_hat = flux_hat_full
-
-    # Reshape to [T, H, W].
-    flux_video = flux_hat.T.reshape(T_vid, H, W)  # [T, H, W]
+    # Reshape to [seq_len, H, W].
+    flux_video = flux_hat.T.reshape(seq_len, H, W)  # [seq_len, H, W]
     print(f"\nReconstructed flux range: [{flux_video.min():.1f}, {flux_video.max():.1f}]")
 
     # ------------------------------------------------------------------
