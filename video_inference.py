@@ -600,6 +600,13 @@ def main() -> None:
         bin_counts_all[sl] = bin_binary_batch(binary_chunk, bin_edges)
         ppp_scales_all[sl] = ppp_chunk
 
+    # Save the binned SPAD observations as a video.
+    spad_video = bin_counts_all.T.reshape(seq_len, H, W)  # [seq_len, H, W]
+    spad_frames = flux_to_video_frames(spad_video)
+    spad_path = os.path.splitext(args.output)[0] + "_spad.mp4"
+    os.makedirs(os.path.dirname(os.path.abspath(spad_path)), exist_ok=True)
+    save_video_mp4(spad_frames, spad_path, fps=args.fps)
+
     # ------------------------------------------------------------------
     # 4.  DiffPIR inference  (batched over pixels)
     # ------------------------------------------------------------------
