@@ -400,6 +400,84 @@ def sample_diffpir_photon_flux(
 
 
 # ---------------------------------------------------------------------------
+# Zarr I/O  (mirrors write_quantaframes_zarr from ihpp_data.py)
+# ---------------------------------------------------------------------------
+
+def save_binary_zarr(
+    path: str,
+    binary: np.ndarray,
+    *,
+    T_exp: float,
+) -> None:
+    """
+    Write binary SPAD frames to a Zarr store, following the same layout and
+    metadata conventions as write_quantaframes_zarr() in ihpp_data.py.
+
+    Parameters
+    ----------
+    path : str
+        Output zarr path (directory).
+    binary : ndarray [T, H, W]  uint8
+        Raw binary detection frames — shape (n_spad_frames, H, W).
+    T_exp : float
+        Total observation time in seconds.
+    """
+    import zarr
+
+    binary = np.asarray(binary, dtype=np.uint8)
+    T, H, W = binary.shape
+    fps_val = T / T_exp
+
+    # Same chunking heuristic as write_quantaframes_zarr
+    max_frames_per_chunk = max(1, 200_000_000 // (H * W))
+
+    # Statistics
+    npoints = int(np.count_nonzero(binary))
+    npts_persec_perpix = np.count_nonzero(binary, axis=0) / T_exp  # [H, W]
+
+    store = zarr.open_group(path, mode="w")
+
+    # Compressor: zarr v3 API first, fall back to zarr v2 / numcodecs
+    try:
+        compressor = zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+        frames_arr = store.create_array(
+            "frames",
+            shape=(T, H, W),
+            chunks=(max_frames_per_chunk, H, W),
+            dtype="uint8",
+            compressors=compressor,
+        )
+    except AttributeError:
+        from numcodecs import Blosc
+        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+        frames_arr = store.create_dataset(
+            "frames",
+            shape=(T, H, W),
+            chunks=(max_frames_per_chunk, H, W),
+            dtype="uint8",
+            compressor=compressor,
+        )
+
+    frames_arr[:] = binary
+
+    store.attrs.update({
+        "fps":                       float(fps_val),
+        "T_exp":                     float(T_exp),
+        "T":                         int(T),
+        "H":                         int(H),
+        "W":                         int(W),
+        "shape":                     "(T, H, W)",
+        "npoints":                   npoints,
+        "avg_pts_persec_perpixel":   float(npoints / (T_exp * H * W)),
+        "max_pts_persec_perpixel":   float(np.max(npts_persec_perpix)),
+        "min_pts_persec_perpixel":   float(np.min(npts_persec_perpix)),
+        "med_pts_persec_perpixel":   float(np.median(npts_persec_perpix)),
+        "stddev_pts_persec_perpixel":float(np.std(npts_persec_perpix, ddof=1)),
+    })
+    print(f"Saved binary zarr : {path}  ({npoints:,} detections, shape=({T},{H},{W}))")
+
+
+# ---------------------------------------------------------------------------
 # Video I/O
 # ---------------------------------------------------------------------------
 
@@ -500,6 +578,10 @@ def main() -> None:
                      help="Number of pixels processed per GPU batch")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fps", type=int, default=30, help="Output video frame rate")
+    ap.add_argument("--binary_zarr", type=str, default=None,
+                     help="If set, save raw binary SPAD frames (n_spad_frames, H, W) "
+                          "to this zarr path. "
+                          "Note: requires ~H*W*n_spad_frames bytes of extra RAM.")
 
     # Performance
     ap.add_argument("--use_amp", action="store_true",
@@ -588,6 +670,14 @@ def main() -> None:
     bin_counts_all = np.empty((num_pixels, seq_len), dtype=np.float32)
     ppp_scales_all = np.empty((num_pixels,), dtype=np.float32)
 
+    # Pre-allocate full binary cube only when zarr saving is requested.
+    binary_all_np: Optional[np.ndarray] = None
+    if args.binary_zarr is not None:
+        mem_gb = num_pixels * args.n_spad_frames / 1e9
+        print(f"--binary_zarr requested; allocating {mem_gb:.2f} GB for binary cube "
+              f"({args.n_spad_frames} frames × {num_pixels} pixels).")
+        binary_all_np = np.empty((num_pixels, args.n_spad_frames), dtype=np.uint8)
+
     for sl in tqdm(list(chunked_indices(num_pixels, spad_chunk)), desc="SPAD sim"):
         flux_chunk = flux_for_infer[sl]
         binary_chunk, ppp_chunk = generate_spad_binary_batch(
@@ -599,6 +689,16 @@ def main() -> None:
         )
         bin_counts_all[sl] = bin_binary_batch(binary_chunk, bin_edges)
         ppp_scales_all[sl] = ppp_chunk
+        if binary_all_np is not None:
+            binary_all_np[sl] = binary_chunk
+
+    # Write binary cube to zarr: reshape [num_pixels, T] -> [T, H, W] then save.
+    if binary_all_np is not None:
+        print("\nWriting binary SPAD frames to zarr ...")
+        binary_thw = binary_all_np.T.reshape(args.n_spad_frames, H, W)
+        del binary_all_np  # free [num_pixels, T] copy before writing
+        save_binary_zarr(args.binary_zarr, binary_thw, T_exp=args.t_total)
+        del binary_thw
 
     # Save the binned SPAD observations as a video.
     spad_video = bin_counts_all.T.reshape(seq_len, H, W)  # [seq_len, H, W]

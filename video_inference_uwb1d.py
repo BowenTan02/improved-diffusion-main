@@ -177,17 +177,16 @@ def temporal_bin_chunk(flux_chunk: np.ndarray, target_bins: int) -> np.ndarray:
         return flux_chunk.astype(np.float32)
 
     if T_full % target_bins == 0:
-        # Fast path: equal-size bins.
+        # Fast path: equal-size bins — sum across each bin.
         m = T_full // target_bins
-        return flux_chunk.reshape(N, target_bins, m).mean(axis=2).astype(np.float32)
+        return flux_chunk.reshape(N, target_bins, m).sum(axis=2).astype(np.float32)
 
-    # General path: use np.add.reduceat with pre-computed edges.
+    # General path: use np.add.reduceat with pre-computed edges — sum, no division.
     edges = np.linspace(0, T_full, target_bins + 1, dtype=np.int64)
-    bin_sizes = np.diff(edges).astype(np.float64)            # [target_bins]
     out = np.empty((N, target_bins), dtype=np.float32)
     for i in range(N):
         sums = np.add.reduceat(flux_chunk[i].astype(np.float64), edges[:-1].astype(np.intp))
-        out[i] = (sums[:target_bins] / bin_sizes).astype(np.float32)
+        out[i] = sums[:target_bins].astype(np.float32)
     return out
 
 
@@ -266,9 +265,52 @@ def flux_to_video_frames(flux: np.ndarray) -> np.ndarray:
 def save_video_mp4(frames: np.ndarray, path: str, fps: int = 30) -> None:
     """
     Write [T, H, W] uint8 grayscale frames to an MP4 file.
-    Tries cv2 (OpenCV) first, then falls back to imageio.
+
+    Strategy (in order):
+      1. ffmpeg subprocess — pipes raw 'gray' pixels directly into libx264
+         with pix_fmt yuv420p.  This is the only reliable path for true
+         grayscale at arbitrary FPS: no fake-RGB conversion, no chroma noise.
+      2. OpenCV VideoWriter (isColor=False) — fallback if ffmpeg is absent.
+      3. imageio — last resort; stacks to RGB before encoding.
     """
+    import subprocess
+
     T, H, W = frames.shape
+    frames = np.ascontiguousarray(frames, dtype=np.uint8)
+
+    # ------------------------------------------------------------------
+    # 1. ffmpeg (primary)
+    # ------------------------------------------------------------------
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{W}x{H}",
+            "-pix_fmt", "gray",
+            "-r", str(fps),
+            "-i", "pipe:",
+            "-an",
+            "-vcodec", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            path,
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for t in range(T):
+            proc.stdin.write(frames[t].tobytes())
+        proc.stdin.close()
+        proc.wait()
+        if proc.returncode == 0:
+            print(f"Saved video via ffmpeg  : {path}")
+            return
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
+    except Exception as e:
+        print(f"ffmpeg failed ({e}), trying OpenCV ...")
+
+    # ------------------------------------------------------------------
+    # 2. OpenCV (fallback)
+    # ------------------------------------------------------------------
     try:
         import cv2
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -278,11 +320,14 @@ def save_video_mp4(frames: np.ndarray, path: str, fps: int = 30) -> None:
         for t in range(T):
             writer.write(frames[t])
         writer.release()
-        print(f"Saved video via OpenCV : {path}")
+        print(f"Saved video via OpenCV  : {path}")
         return
     except Exception as e:
-        print(f"OpenCV video write failed ({e}), trying imageio ...")
+        print(f"OpenCV failed ({e}), trying imageio ...")
 
+    # ------------------------------------------------------------------
+    # 3. imageio (last resort)
+    # ------------------------------------------------------------------
     import imageio.v3 as iio
     frames_rgb = np.stack([frames, frames, frames], axis=-1)  # [T, H, W, 3]
     iio.imwrite(path, frames_rgb, fps=fps, codec="libx264")

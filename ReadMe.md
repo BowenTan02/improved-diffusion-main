@@ -54,6 +54,10 @@ CUDA_VISIBLE_DEVICES=1 python scripts/temporal_train.py \
     --lr_anneal_steps 200000 --normalize False --log_dir log
 ```
 
+```bash
+mpiexec -n 4 python scripts/temporal_train.py --data_path data/10K_log_flux_dataset.pt --sequence_length 10240 --num_channels 64 --channel_mult "1,1,2,2,4,4" --num_res_blocks 2 --attention_resolutions "640,320" --batch_size 64 --lr 1e-4 --use_fp16 True --use_checkpoint True --diffusion_steps 1000 --noise_schedule cosine --save_interval 10000 --lr_anneal_steps 150000 --normalize False --log_dir 10k_log
+```
+
 ### 4. Generate Samples
 
 ```bash
