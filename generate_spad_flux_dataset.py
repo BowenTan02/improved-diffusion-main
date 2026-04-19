@@ -568,7 +568,7 @@ def save_dataset(flux_dataset, metadata_list, output_dir='./data'):
         log_flux_max = log_flux.max()
         normalized_flux = (log_flux_pt - log_flux_min) / (log_flux_max - log_flux_min)
         normalized_flux = normalized_flux * 2 - 1
-
+        print(f"  Normalized flux range: [{normalized_flux.min():.2f}, {normalized_flux.max():.2f}]")
         normalized_flux_pt = torch.from_numpy(normalized_flux[:, 0, :])
         normalized_flux_pt_path = os.path.join(output_dir, '10K_normalized_log_flux_dataset.pt')
         torch.save(normalized_flux_pt, normalized_flux_pt_path)
