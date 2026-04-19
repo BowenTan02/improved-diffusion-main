@@ -20,48 +20,29 @@ from tqdm import tqdm
 import os
 
 # Configuration
-NUM_SAMPLES = 1000
-SEQ_LENGTH = 1024
+NUM_SAMPLES = 60_000
+SEQ_LENGTH = 10_240
 T_MAX = 1.0
 DT = T_MAX / SEQ_LENGTH
 FLUX_MIN = 0.0
-FLUX_MAX = 10000.0
+FLUX_MAX = 20000.0
 SMOOTH_SIGMA = 1.0
 
-# PATTERN_DISTRIBUTION = {
-#     'step_nondecreasing': 0.05,
-#     'step_general': 0.05,
-#     'gaussian_bumps': 0.05,
-#     'exponential': 0.05,
-#     'wavelet': 0.05,
-#     'periodic': 0.05,
-#     'polynomial': 0.05,
-#     'pulsed_laser': 0.05,
-#     'sigmoid_transition': 0.05,
-#     'piecewise_linear': 0.05,
-#     'plateau_with_transients': 0.05,
-#     'chirp': 0.05,
-#     'sawtooth': 0.05,
-#     'constant': 0.05,
-#     'complex_combination': 0.30,
-# }
-
 PATTERN_DISTRIBUTION = {
-    'step_nondecreasing': 0.0,
-    'step_general': 0.0,
-    'gaussian_bumps': 0.0,
-    'exponential': 0.0,
-    'wavelet': 0.0,
-    'periodic': 0.0,
-    'polynomial': 0.0,
-    'pulsed_laser': 0.0,
-    'sigmoid_transition': 0.0,
-    'piecewise_linear': 0.0,
-    'plateau_with_transients': 0.0,
-    'chirp': 1.0,
-    'sawtooth': .0,
-    'constant': 0.0,
-    'complex_combination': 0.0,
+    'step_nondecreasing': 0.05,
+    'step_general': 0.05,
+    'gaussian_bumps': 0.05,
+    'exponential': 0.05,
+    'wavelet': 0.05,
+    'periodic': 0.05,
+    'polynomial': 0.05,
+    'pulsed_laser': 0.05,
+    'piecewise_linear': 0.05,
+    'plateau_with_transients': 0.05,
+    'chirp': 0.05,
+    'sawtooth': 0.05,
+    'constant': 0.05,
+    'complex_combination': 0.35,
 }
 
 assert abs(sum(PATTERN_DISTRIBUTION.values()) - 1.0) < 1e-6, \
@@ -558,30 +539,42 @@ def save_dataset(flux_dataset, metadata_list, output_dir='./data'):
     # print(f"✓ Saved log flux dataset to: {log_flux_path}")
     # print(f"  Size: {os.path.getsize(log_flux_path) / 1024 / 1024:.2f} MB")
 
-    # metadata_path = os.path.join(output_dir, 'gaussian_metadata.json')
-    # with open(metadata_path, 'w') as f:
-    #     json.dump({
-    #         'dataset_info': {
-    #             'num_samples': NUM_SAMPLES,
-    #             'sequence_length': SEQ_LENGTH,
-    #             'time_range': [0, T_MAX],
-    #             'dt': DT,
-    #             'flux_range': [FLUX_MIN, FLUX_MAX],
-    #             'log_flux_range': [float(log_flux.min()), float(log_flux.max())],
-    #             'smooth_sigma': SMOOTH_SIGMA,
-    #             'pattern_distribution': PATTERN_DISTRIBUTION,
-    #         },
-    #         'samples': metadata_list
-    #     }, f, indent=2)
-    # print(f"✓ Saved metadata to: {metadata_path}")
+    metadata_path = os.path.join(output_dir, '10K_metadata.json')
+    with open(metadata_path, 'w') as f:
+        json.dump({
+            'dataset_info': {
+                'num_samples': NUM_SAMPLES,
+                'sequence_length': SEQ_LENGTH,
+                'time_range': [0, T_MAX],
+                'dt': DT,
+                'flux_range': [FLUX_MIN, FLUX_MAX],
+                'log_flux_range': [float(log_flux.min()), float(log_flux.max())],
+                'smooth_sigma': SMOOTH_SIGMA,
+                'pattern_distribution': PATTERN_DISTRIBUTION,
+            },
+            'samples': metadata_list
+        }, f, indent=2)
+    print(f"✓ Saved metadata to: {metadata_path}")
 
     try:
         import torch
         log_flux_pt = torch.from_numpy(log_flux[:, 0, :])
-        log_flux_pt_path = os.path.join(output_dir, 'chirp_log_flux_dataset.pt')
+        log_flux_pt_path = os.path.join(output_dir, '10K_log_flux_dataset.pt')
         torch.save(log_flux_pt, log_flux_pt_path)
         print(f"✓ Saved PyTorch log flux dataset to: {log_flux_pt_path}")
         print(f"  Shape: {log_flux_pt.shape}")
+
+        log_flux_min = log_flux.min()
+        log_flux_max = log_flux.max()
+        normalized_flux = (log_flux_pt - log_flux_min) / (log_flux_max - log_flux_min)
+        normalized_flux = normalized_flux * 2 - 1
+
+        normalized_flux_pt = torch.from_numpy(normalized_flux[:, 0, :])
+        normalized_flux_pt_path = os.path.join(output_dir, '10K_normalized_log_flux_dataset.pt')
+        torch.save(normalized_flux_pt, normalized_flux_pt_path)
+        print(f"✓ Saved PyTorch normalized log flux dataset to: {normalized_flux_pt_path}")
+        print(f"  Shape: {normalized_flux_pt.shape}")
+
     except ImportError:
         print("  (PyTorch not available, skipping .pt format)")
 
@@ -613,7 +606,7 @@ def visualize_samples(flux_dataset, num_samples=10):
 
         output_dir = './data'
         os.makedirs(output_dir, exist_ok=True)
-        plot_path = os.path.join(output_dir, 'new_flux_samples_visualization.png')
+        plot_path = os.path.join(output_dir, '10K_flux_samples_visualization.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         print(f"✓ Saved visualization to: {plot_path}")
         plt.close()
