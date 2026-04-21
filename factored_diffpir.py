@@ -1,9 +1,11 @@
 """Factored DiffPIR sampler: 1D temporal prior + 2D spatial prior via convex
 Tweedie combination.
 
-The forward observation model is the same as the existing 1D pipeline — per
+The forward observation model is the same as the validated 1D pipeline — per
 pixel SPAD binary detections are simulated, then binned to `sequence_length`
-time bins and used as a Poisson-like data term (via the Anscombe VST).
+time bins and used as a Binomial (per-SPAD-frame Bernoulli) likelihood in the
+data subproblem. Flux is parameterised in log1p space to match the 1D model's
+training transform (`phi = expm1(x).clamp(min=0)`).
 
 At every reverse diffusion step we compute TWO Tweedie x0 estimates:
   - x0_temporal: the 1D UNet applied per pixel across the time axis
@@ -16,7 +18,7 @@ The data subproblem and the DDIM update then proceed as in vanilla DiffPIR.
 When alpha_s == 0.0 no 2D forward pass is performed, and the loop reduces
 *exactly* to 1D-only DiffPIR (see tests/test_factored_alpha0_equivalence.py).
 
-Primary tensor layout: `x_t` is kept as [B, H, W, T] log-flux. Reshapes into
+Primary tensor layout: `x_t` is kept as [B, H, W, T] log1p-flux. Reshapes into
 1D [B*H*W, 1, T] and 2D [B*T, H, W] views happen only around model calls.
 """
 
@@ -47,8 +49,7 @@ def simulate_spad_cube(
     """Simulate SPAD binary detections for a [B, H, W, T_gt] linear-flux cube.
 
     Scales each pixel's flux so that the CUBE-mean matches `target_ppp` per
-    frame (i.e. one global scaling — not per-pixel — so spatial brightness
-    contrast is preserved; per-pixel normalization would flatten every pixel).
+    frame (one global scaling — spatial brightness contrast is preserved).
 
     Returns
     -------
@@ -61,7 +62,6 @@ def simulate_spad_cube(
     B, H, W, T_gt = flux_cube.shape
     flux = flux_cube.astype(np.float64)
 
-    # Temporal interp from T_gt -> n_spad_frames on the time axis.
     if T_gt != n_spad_frames:
         t_src = np.linspace(0.0, T_exp, T_gt)
         t_dst = np.linspace(0.0, T_exp, n_spad_frames)
@@ -80,7 +80,7 @@ def simulate_spad_cube(
     else:
         scale = 1.0
     flux_gt = flux_hi * scale
-    N_t = flux_gt * dt_frame  # expected photons per SPAD frame, per pixel
+    N_t = flux_gt * dt_frame
 
     det_prob = 1.0 - np.exp(-(N_t + dark_count))
     binary = (rng.random(det_prob.shape) < det_prob).astype(np.uint8)
@@ -105,39 +105,71 @@ def bin_binary_time(binary: np.ndarray, target_bins: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Anscombe-VST Poisson data step.
+# Poisson (Binomial) data step — matches the validated 1D pipeline.
+# Uses `phi = expm1(x).clamp(min=0)` because x is log1p-flux (the 1D model's
+# training transform). Anscombe VST intentionally dropped.
 # ---------------------------------------------------------------------------
 
-def anscombe_data_step(
-    x0_pred: torch.Tensor,          # [N, 1, T] log-flux
-    counts: torch.Tensor,           # [N, 1, T] non-negative float
+def poisson_data_step(
+    x0_pred: torch.Tensor,          # [N, 1, T] log1p-flux
+    counts: torch.Tensor,           # [N, 1, T] photon counts per bin
     *,
-    bin_size: float,                # SPAD frames per bin (integer in practice)
+    bin_size: float,                # SPAD frames per bin
     dt_spad: float,                 # seconds per SPAD frame
-    rho_t: torch.Tensor,            # scalar
-    sigma_t_bar: float,
+    rho_t: torch.Tensor,            # scalar proximal weight
+    sigma_t_bar: float,             # sqrt(1 - alpha_bar_t); unused here, kept for API parity
     n_iter: int = 5,
     lr_scale: float = 0.5,
+    dark_count: float = 0.0,
+    total_count_weight: float = 1e-3,
+    T_exp: float = 1.0,
 ) -> torch.Tensor:
-    """Gradient-based data step with Anscombe-transformed Poisson likelihood.
+    """Proximal-gradient Binomial likelihood data step.
 
-    Under the Anscombe VST, `y_ans = 2*sqrt(counts + 3/8) ~ N(2*sqrt(lam+3/8), 1)`
-    where `lam = exp(x) * bin_size * dt_spad` is the expected count per bin.
-    We minimize `0.5*(y_ans - y_hat(x))^2 + rho_t/2 * ||x - x0_pred||^2`
+    Each bin covers `bin_size` SPAD frames of duration `dt_spad`. Per-frame
+    detection probability `p = 1 - exp(-(N + dark_count))` with
+    `N = phi * dt_spad` and `phi = expm1(x).clamp(min=0)` (linear flux — `x`
+    is log1p-flux, matching the training-time transform of the 1D model).
+
+    The bin count is modelled as Binomial(bin_size, p). We minimise
+        NLL + total_count_weight · (∫phi dt − N_obs)² + (rho_t / 2) · ||x − x0||²
     with a few proximal-gradient steps.
     """
-    x = x0_pred.clone().requires_grad_(True)
-    y_ans = 2.0 * torch.sqrt(counts + 0.375)
-    step = lr_scale * (sigma_t_bar ** 2) / (2.0 * rho_t + 1e-8)
+    x = x0_pred.detach().clone().clamp(-10.0, 15.0).requires_grad_(True)
+    T = x.shape[-1]
+
+    # Total-count anchor: observed detections -> per-frame mean -> expected total.
+    total_det = counts.sum(-1).mean().item()
+    total_frames = float(bin_size) * T
+    det_rate = float(np.clip(total_det / (total_frames + 1e-8), 1e-8, 1.0 - 1e-3))
+    N_per_frame = -np.log(1.0 - det_rate)
+    mean_flux_target = max((N_per_frame - dark_count) / (dt_spad + 1e-10), 1.0)
+    N_obs = mean_flux_target * T_exp
+
     for _ in range(n_iter):
-        phi = torch.exp(x.clamp(-15.0, 10.0))
-        lam = phi * (bin_size * dt_spad)
-        y_hat = 2.0 * torch.sqrt(lam + 0.375)
-        nll = 0.5 * ((y_ans - y_hat) ** 2).sum()
-        prox = 0.5 * rho_t * ((x - x0_pred) ** 2).sum()
-        loss = nll + prox
+        phi = torch.expm1(x.clamp(-15.0, 10.0)).clamp(min=0.0)
+        N_k = phi * dt_spad + dark_count
+        p_k = (1.0 - torch.exp(-N_k)).clamp(1e-8, 1.0 - 1e-8)
+        nll = -(
+            counts * torch.log(p_k)
+            + (bin_size - counts) * torch.log(1.0 - p_k)
+        ).sum(-1).mean()
+
+        flux_integral = (phi * dt_spad * bin_size).sum(-1)
+        count_penalty = total_count_weight * (
+            (flux_integral - N_obs) ** 2 / (N_obs + 1e-8)
+        ).mean()
+
+        prox = 0.5 * rho_t * ((x - x0_pred) ** 2).sum(dim=[1, 2]).mean()
+        loss = nll + count_penalty + prox
+
         grad = torch.autograd.grad(loss, x)[0]
+        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
         with torch.no_grad():
+            # Lipschitz-ish step: dominated by bin_size · N_k^2 term.
+            L_nll = (bin_size * (dt_spad * phi) ** 2 * torch.exp(-N_k)).max()
+            L_nll = torch.nan_to_num(L_nll, nan=0.0, posinf=1e6, neginf=0.0)
+            step = lr_scale / (L_nll + rho_t + 1e-8)
             x = (x - step * grad).clamp(-10.0, 10.0)
         x = x.detach().requires_grad_(True)
     return x.detach()
@@ -149,15 +181,36 @@ def anscombe_data_step(
 
 @dataclass
 class FactoredConfig:
-    sequence_length: int = 1024
+    sequence_length: int = 1024         # 1D UNet was trained at T=1024; keep fixed
     num_sampling_steps: int = 100
     eta: float = 0.85
     lambda_data: float = 1.0
     pp_iters: int = 5
     pp_lr_scale: float = 0.5
     alpha_s: float = 0.0
-    chunk_1d: int = 4096    # pixels per 1D forward chunk
-    chunk_2d: int = 8       # time-slices per 2D forward chunk
+    chunk_1d: int = 4096                # pixels per 1D forward chunk
+    chunk_2d: int = 32                  # time-slices per 2D forward chunk
+
+    # Noise-aligned 2D call: when True, the 2D UNet is invoked at t' such
+    # that 1 − alpha_bar_{t'} = scale^2 · (1 − alpha_bar_t). Required whenever
+    # the bridge scale != 1 (currently scale ≈ 0.217 for [0, 9.2103] -> [-1, +1]).
+    align_2d_noise: bool = True
+
+    # --- Speedups for the 2D branch -------------------------------------
+    # Compute the 2D Tweedie estimate on every `frame_stride_2d`-th frame and
+    # broadcast it to its neighbours (nearest). stride=1 is the original
+    # behaviour; stride=4 gives a ~4x speedup on the 2D branch with little
+    # quality loss because the 2D prior varies slowly along the time axis.
+    frame_stride_2d: int = 1
+    # Skip the 2D branch entirely when the *mapped* 2D step t' <= this cut-off.
+    # At low t the 1D data step dominates and the 2D prior's x0 ≈ x_t contributes
+    # little; skipping saves many of the expensive 256² forwards.
+    t_prime_skip_below: int = 1
+
+    # Data-step likelihood parameters.
+    dark_count: float = 0.0
+    total_count_weight: float = 1e-3
+    T_exp: float = 1.0
 
 
 def _chunked_forward_1d(model_1d, x_1d, t_tensor_scalar, *, chunk, device):
@@ -171,8 +224,9 @@ def _chunked_forward_1d(model_1d, x_1d, t_tensor_scalar, *, chunk, device):
     return out
 
 
-def _chunked_denoise_2d(model_2d, diffusion_2d, norm_params, x_2d_flat, t_scalar, *, chunk):
-    """x_2d_flat: [N, H, W] in log-flux space. Returns x0_hat: [N, H, W]."""
+def _chunked_denoise_2d(model_2d, diffusion_2d, norm_params, x_2d_flat, t_scalar,
+                         *, chunk, align_noise=False, alphas_cumprod_1d=None):
+    """x_2d_flat: [N, H, W] in log1p-flux space. Returns x0_hat: [N, H, W]."""
     N = x_2d_flat.shape[0]
     out = torch.empty_like(x_2d_flat)
     for s in range(0, N, chunk):
@@ -181,6 +235,8 @@ def _chunked_denoise_2d(model_2d, diffusion_2d, norm_params, x_2d_flat, t_scalar
             x_2d_flat[s:e], t=int(t_scalar),
             model_2d=model_2d, diffusion_2d=diffusion_2d,
             normalization_params=norm_params,
+            align_noise=align_noise,
+            alphas_cumprod_1d=alphas_cumprod_1d,
         )
     return out
 
@@ -194,29 +250,49 @@ def factored_sample_flux(
     diffusion_2d=None,
     norm_params: Optional[NormalizationParams] = None,
     cfg: FactoredConfig = FactoredConfig(),
-    bin_size: int = 1,              # n_spad_frames per seq-bin
-    dt_spad: float = 1e-5,          # seconds per SPAD frame
+    bin_size: int = 1,
+    dt_spad: float = 1e-5,
     device: Optional[torch.device] = None,
     seed: int = 0,
     verbose: bool = True,
 ):
-    """Run factored DiffPIR on a cube; returns estimated log-flux [B, H, W, T]."""
+    """Run factored DiffPIR on a cube; returns estimated log1p-flux [B, H, W, T]."""
     if device is None:
         device = counts_binned.device
     B, H, W, T = counts_binned.shape
-    assert T == cfg.sequence_length, f"seq mismatch: {T} vs {cfg.sequence_length}"
+    assert T == cfg.sequence_length, (
+        f"seq mismatch: input T={T} vs cfg.sequence_length={cfg.sequence_length}"
+    )
 
     use_2d = cfg.alpha_s > 0.0
     if use_2d and (model_2d is None or diffusion_2d is None or norm_params is None):
         raise ValueError("alpha_s > 0 requires model_2d, diffusion_2d, and norm_params")
 
-    # Move schedule tensors to device.
+    # The t-shift handles mismatched schedules correctly as long as both
+    # `alphas_cumprod` arrays are monotone in `1 - alpha_bar`. We warn — not
+    # assert — when they differ, because the correct cross-schedule behaviour
+    # is to searchsorted on the 2D schedule inside `t_prime_from_t`. Setting
+    # `align_2d_noise=False` with mismatched schedules is a silent bug — keep
+    # the hard stop for that combination only.
+    if use_2d:
+        schedules_match = (
+            diffusion_1d.num_timesteps == diffusion_2d.num_timesteps
+            and np.allclose(
+                diffusion_1d.alphas_cumprod, diffusion_2d.alphas_cumprod, rtol=1e-6,
+            )
+        )
+        if not schedules_match and not cfg.align_2d_noise:
+            raise ValueError(
+                "1D and 2D schedules differ "
+                f"(1D: T={diffusion_1d.num_timesteps}, "
+                f"2D: T={diffusion_2d.num_timesteps}) "
+                "but `align_2d_noise=False`. Enable `align_2d_noise=True` — "
+                "the t-shift handles cross-schedule variance matching "
+                "(e.g. 1D linear T=1000 vs 2D cosine T=4000)."
+            )
+
     alphas_cumprod = torch.from_numpy(diffusion_1d.alphas_cumprod).to(device).float()
 
-    # Reproducible init noise AND DDIM noise — alpha_s=0 equivalence requires
-    # that the RNG stream consumed during sampling is independent of whether
-    # the 2D branch is present. We seed both the CPU `Generator` used for the
-    # initial noise and the global torch RNG used inside DDIM.
     gen = torch.Generator(device="cpu").manual_seed(seed)
     x_t = torch.randn((B, H, W, T), generator=gen).to(device)
     torch.manual_seed(seed + 1)
@@ -229,9 +305,16 @@ def factored_sample_flux(
     if verbose:
         it = tqdm(list(it), total=len(timesteps), desc=f"factored(α_s={cfg.alpha_s})")
 
-    counts_flat = counts.permute(0, 3, 1, 2).reshape(B * T, H, W)   # unused; kept for clarity
-    # Flat views reused every step:
-    # 1D layout: [B*H*W, 1, T]; 2D layout: [B*T, H, W]
+    # Precompute which frame indices get an actual 2D call.
+    stride = max(1, int(cfg.frame_stride_2d))
+    frame_idx = torch.arange(T, device=device)
+    if stride > 1:
+        anchor_idx = torch.arange(0, T, stride, device=device)
+        # Nearest anchor for each frame (left-biased).
+        nearest = (frame_idx // stride).clamp(max=len(anchor_idx) - 1)
+    else:
+        anchor_idx = frame_idx
+        nearest = frame_idx
 
     for step_idx, t in it:
         t_int = int(t)
@@ -250,14 +333,38 @@ def factored_sample_flux(
 
         # --- 2D branch (skipped entirely when alpha_s == 0) ----------------
         if use_2d:
-            x_t_2d = x_t.permute(0, 3, 1, 2).reshape(B * T, H, W)
-            with torch.no_grad():
-                x0_2d_flat = _chunked_denoise_2d(
-                    model_2d, diffusion_2d, norm_params, x_t_2d, t_int,
-                    chunk=cfg.chunk_2d,
+            # Compute t' for the noise-aligned call so we can also gate on it.
+            # Search on the *2D* schedule (which may differ from 1D's).
+            if cfg.align_2d_noise:
+                from spatial_prior import t_prime_from_t
+                t_prime = t_prime_from_t(
+                    t_int,
+                    norm_params.scale,
+                    alphas_cumprod_2d=diffusion_2d.alphas_cumprod,
+                    alphas_cumprod_1d=diffusion_1d.alphas_cumprod,
                 )
-            x0_spatial = x0_2d_flat.reshape(B, T, H, W).permute(0, 2, 3, 1)
-            x0_combined = cfg.alpha_s * x0_spatial + (1.0 - cfg.alpha_s) * x0_temporal
+            else:
+                t_prime = t_int
+
+            if t_prime < cfg.t_prime_skip_below:
+                # 2D would be called at t' ≈ 0 — Tweedie ≈ x_t, little benefit.
+                x0_combined = x0_temporal
+            else:
+                # Only denoise anchor frames; broadcast to neighbours via `nearest`.
+                x_t_bht = x_t.permute(0, 3, 1, 2)                       # [B, T, H, W]
+                x_t_anchors = x_t_bht.index_select(1, anchor_idx)        # [B, T_a, H, W]
+                x_t_2d = x_t_anchors.reshape(-1, H, W)
+                with torch.no_grad():
+                    x0_2d_flat = _chunked_denoise_2d(
+                        model_2d, diffusion_2d, norm_params, x_t_2d, t_int,
+                        chunk=cfg.chunk_2d,
+                        align_noise=cfg.align_2d_noise,
+                        alphas_cumprod_1d=diffusion_1d.alphas_cumprod,
+                    )
+                x0_2d_anchors = x0_2d_flat.reshape(B, len(anchor_idx), H, W)
+                # Nearest-neighbour upsample back to T frames.
+                x0_spatial = x0_2d_anchors.index_select(1, nearest).permute(0, 2, 3, 1)
+                x0_combined = cfg.alpha_s * x0_spatial + (1.0 - cfg.alpha_s) * x0_temporal
         else:
             x0_combined = x0_temporal
 
@@ -266,11 +373,14 @@ def factored_sample_flux(
         counts_1d = counts.reshape(B * H * W, 1, T)
         sigma_t_bar = float(sqrt_1mab.item())
         rho_t = torch.tensor(cfg.lambda_data / (sigma_t_bar ** 2 + 1e-8), device=device)
-        x0_hat_flat = anscombe_data_step(
+        x0_hat_flat = poisson_data_step(
             x0_flat, counts_1d,
             bin_size=float(bin_size), dt_spad=float(dt_spad),
             rho_t=rho_t, sigma_t_bar=sigma_t_bar,
             n_iter=cfg.pp_iters, lr_scale=cfg.pp_lr_scale,
+            dark_count=cfg.dark_count,
+            total_count_weight=cfg.total_count_weight,
+            T_exp=cfg.T_exp,
         )
         x0_hat = x0_hat_flat.reshape(B, H, W, T)
 
@@ -286,7 +396,6 @@ def factored_sample_flux(
             )
             dir_xt = torch.sqrt(torch.clamp(1.0 - ab_prev - sigma_t ** 2, min=0.0)) * eps_hat
             if cfg.eta > 0:
-                # Match the 1D-only DiffPIR noise shape so alpha_s=0 matches exactly.
                 noise = torch.randn_like(x_t)
             else:
                 noise = 0.0

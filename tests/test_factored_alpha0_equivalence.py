@@ -146,7 +146,7 @@ def test_alpha0_equivalence_vs_handwritten_1d(tiny_cube, tiny_1d):
     inline 1D-only DiffPIR loop that does not know the factored module
     exists. Both use the same seed, cube, model, and data step.
     """
-    from factored_diffpir import anscombe_data_step
+    from factored_diffpir import poisson_data_step
 
     model_1d, diffusion_1d = tiny_1d
     B, H, W, T = tiny_cube.shape

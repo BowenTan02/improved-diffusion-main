@@ -24,6 +24,7 @@ from spatial_prior import (  # noqa: E402
     to_2d_space,
     from_2d_space,
     denoise_frame_2d,
+    t_prime_from_t,
 )
 
 
@@ -218,6 +219,111 @@ def test_denoise_shape_batch(params):
     x0_b = denoise_frame_2d(x_t, t=t_vec, model_2d=model, diffusion_2d=diffusion,
                              normalization_params=params)
     assert x0_b.shape == (B, H, W)
+
+
+# ---------------------------------------------------------------------------
+# Noise-aligned t-shift for the affine bridge (no checkpoint needed).
+# ---------------------------------------------------------------------------
+
+
+def test_t_prime_identity_when_scale_is_one():
+    """scale=1 means the bridge is variance-preserving, so t' must equal t."""
+    diffusion = _make_toy_diffusion(T=1000)
+    ab = diffusion.alphas_cumprod
+    for t in [1, 10, 100, 500, 999]:
+        assert t_prime_from_t(t, scale=1.0, alphas_cumprod_2d=ab) == t
+
+
+def test_t_prime_inverts_variance_within_one_step():
+    """For arbitrary scale, 1-ab[t'] must approximate scale^2*(1-ab[t]) to
+    within the spacing of (1-ab) at that t (i.e. one schedule step)."""
+    import numpy as np
+    diffusion = _make_toy_diffusion(T=1000)
+    ab = np.asarray(diffusion.alphas_cumprod)
+    one_m = 1.0 - ab
+    scale = 2.0 / 9.2103  # the user's log1p(0..10000) bridge slope
+    for t in [10, 100, 500, 999]:
+        target = (scale ** 2) * (1.0 - ab[t])
+        tp = t_prime_from_t(t, scale=scale, alphas_cumprod_2d=ab)
+        # Adjacent step gap at t' (linear schedule => roughly uniform).
+        gap = max(one_m[min(tp + 1, len(one_m) - 1)] - one_m[tp],
+                   one_m[tp] - one_m[max(tp - 1, 0)],
+                   1e-8)
+        err = abs(one_m[tp] - target)
+        assert err <= gap * 1.01, (
+            f"t={t}: target={target:.5f}, 1-ab[{tp}]={one_m[tp]:.5f}, "
+            f"err={err:.5f}, gap={gap:.5f}"
+        )
+
+
+def test_t_prime_clamps_to_zero():
+    """Pathologically small scale must clamp t' to 0 (the 2D model would
+    otherwise be asked for negative noise variance)."""
+    diffusion = _make_toy_diffusion(T=1000)
+    ab = diffusion.alphas_cumprod
+    assert t_prime_from_t(t=10, scale=1e-6, alphas_cumprod_2d=ab) == 0
+
+
+def test_t_prime_cross_schedule_1d_linear_2d_cosine():
+    """Cross-schedule case: 1D linear T=1000 × 2D cosine T=4000 (e.g. the
+    ImageNet-64 `--noise_schedule cosine --diffusion_steps 4000` 2D prior).
+    The target variance is computed on the 1D schedule; the searchsorted
+    runs on the 2D schedule; `t'` must land in `[0, T_2D - 1]` and the
+    resulting noise variance must match within one 2D-schedule step."""
+    import numpy as np
+    from improved_diffusion import gaussian_diffusion as gd
+    diff_1d = gd.GaussianDiffusion(
+        betas=gd.get_named_beta_schedule("linear", 1000),
+        model_mean_type=gd.ModelMeanType.EPSILON,
+        model_var_type=gd.ModelVarType.FIXED_LARGE,
+        loss_type=gd.LossType.MSE, rescale_timesteps=False,
+    )
+    diff_2d = gd.GaussianDiffusion(
+        betas=gd.get_named_beta_schedule("cosine", 4000),
+        model_mean_type=gd.ModelMeanType.EPSILON,
+        model_var_type=gd.ModelVarType.FIXED_LARGE,
+        loss_type=gd.LossType.MSE, rescale_timesteps=False,
+    )
+    ab_1d = np.asarray(diff_1d.alphas_cumprod)
+    ab_2d = np.asarray(diff_2d.alphas_cumprod)
+    one_m_2d = 1.0 - ab_2d
+    scale = 2.0 / 9.2103
+
+    for t in [10, 100, 500, 999]:
+        tp = t_prime_from_t(
+            t, scale=scale,
+            alphas_cumprod_2d=ab_2d, alphas_cumprod_1d=ab_1d,
+        )
+        assert 0 <= tp <= len(ab_2d) - 1
+
+        target = (scale ** 2) * (1.0 - ab_1d[t])
+        gap = max(
+            one_m_2d[min(tp + 1, len(one_m_2d) - 1)] - one_m_2d[tp],
+            one_m_2d[tp] - one_m_2d[max(tp - 1, 0)],
+            1e-8,
+        )
+        err = abs(one_m_2d[tp] - target)
+        assert err <= gap * 1.01, (
+            f"cross-schedule t={t}: target={target:.5f}, "
+            f"1-ab_2d[{tp}]={one_m_2d[tp]:.5f}, err={err:.5f}, gap={gap:.5f}"
+        )
+
+
+def test_denoise_align_noise_path_runs():
+    """End-to-end smoke test for the align_noise path: must produce the same
+    shape and finite values as the un-aligned path, on the mock UNet."""
+    import numpy as np
+    diffusion = _make_toy_diffusion(T=1000)
+    model = _ZeroEpsUNet()
+    p = NormalizationParams(source_min=0.0, source_max=9.2103)
+    x_t = torch.empty(2, 32, 32).uniform_(p.source_min, p.source_max)
+    x0 = denoise_frame_2d(
+        x_t, t=500, model_2d=model, diffusion_2d=diffusion,
+        normalization_params=p,
+        align_noise=True, alphas_cumprod_1d=diffusion.alphas_cumprod,
+    )
+    assert x0.shape == (2, 32, 32)
+    assert torch.isfinite(x0).all()
 
 
 # ---------------------------------------------------------------------------
