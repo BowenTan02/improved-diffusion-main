@@ -264,9 +264,11 @@ def rife_interpolate_flux(
     return (g_out * flux_peak).astype(np.float32)
 
 
-def linear_interp_flux(flux: np.ndarray, factor: int) -> np.ndarray:
+def linear_interp_flux(flux: np.ndarray, factor: int, chunk_pairs: int = 256) -> np.ndarray:
     """
     Linearly interpolate along time: T -> 1 + (T-1)*factor.
+    Vectorised with a chunked-in-pairs reduction so peak RAM stays bounded
+    (chunk_pairs * factor * H * W floats at a time).
     """
     if factor <= 1:
         return flux.astype(np.float32, copy=False)
@@ -274,14 +276,18 @@ def linear_interp_flux(flux: np.ndarray, factor: int) -> np.ndarray:
     T_out = 1 + (T - 1) * factor
     out = np.empty((T_out, H, W), dtype=np.float32)
     out[0] = flux[0]
-    idx = 1
-    for i in tqdm(range(T - 1), desc="Linear interp"):
-        I0 = flux[i].astype(np.float32)
-        I1 = flux[i + 1].astype(np.float32)
-        for j in range(1, factor + 1):
-            a = j / factor
-            out[idx] = (1 - a) * I0 + a * I1
-            idx += 1
+
+    alphas = (np.arange(1, factor + 1, dtype=np.float32) / factor).reshape(1, factor, 1, 1)
+    one_minus = 1.0 - alphas
+    pos = 1
+    for p0 in tqdm(range(0, T - 1, chunk_pairs), desc="Linear interp"):
+        p1 = min(p0 + chunk_pairs, T - 1)
+        I0 = flux[p0:p1    ].astype(np.float32)[:, None]   # [m, 1, H, W]
+        I1 = flux[p0 + 1:p1 + 1].astype(np.float32)[:, None]  # [m, 1, H, W]
+        inter = (one_minus * I0 + alphas * I1).reshape(-1, H, W)  # [m*factor, H, W]
+        n = inter.shape[0]
+        out[pos:pos + n] = inter
+        pos += n
     return out
 
 
@@ -604,29 +610,62 @@ def compute_video_metrics(
 ) -> dict:
     """
     PSNR / SSIM / LPIPS per-frame and aggregate (mean over frames).
-    Both inputs are min-max normalized to [0,1] using the GT's own range so the
-    comparison is well-defined regardless of absolute scale.
+    Both inputs are sanitized (NaN/Inf removed) then min-max normalized to
+    [0,1] using the GT's own range so the comparison is well-defined
+    regardless of absolute scale.
     """
     assert recon_thw.shape == gt_thw.shape
     T = recon_thw.shape[0]
 
-    lo = float(gt_thw.min()); hi = float(gt_thw.max())
+    # Sanitize — np.clip does NOT remove NaN, and np.exp can produce ±Inf
+    # from extreme log-flux values. Without this, PSNR/SSIM collapse to NaN.
+    gt64    = np.nan_to_num(gt_thw.astype(np.float64, copy=False),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+    recon64 = np.nan_to_num(recon_thw.astype(np.float64, copy=False),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+    n_bad = int(np.sum(~np.isfinite(recon_thw)))
+    if n_bad:
+        print(f"  [metrics] sanitized {n_bad} non-finite recon entries "
+              f"({100 * n_bad / recon_thw.size:.4f}%).")
+
+    lo = float(gt64.min()); hi = float(gt64.max())
     denom = max(hi - lo, 1e-12)
-    gt01    = np.clip((gt_thw    - lo) / denom, 0.0, 1.0).astype(np.float32)
-    recon01 = np.clip((recon_thw - lo) / denom, 0.0, 1.0).astype(np.float32)
+    gt01    = np.clip((gt64    - lo) / denom, 0.0, 1.0).astype(np.float32)
+    recon01 = np.clip((recon64 - lo) / denom, 0.0, 1.0).astype(np.float32)
 
     # -- PSNR / SSIM via skimage ----------------------------------------------
+    psnr_fn = ssim_fn = None
     try:
-        from skimage.metrics import peak_signal_noise_ratio as psnr_fn
-        from skimage.metrics import structural_similarity as ssim_fn
-        psnr = np.empty(T, dtype=np.float64)
-        ssim = np.empty(T, dtype=np.float64)
-        for t in range(T):
-            psnr[t] = psnr_fn(gt01[t], recon01[t], data_range=1.0)
-            ssim[t] = ssim_fn(gt01[t], recon01[t], data_range=1.0)
+        from skimage.metrics import peak_signal_noise_ratio as _psnr
+        from skimage.metrics import structural_similarity as _ssim
+        psnr_fn, ssim_fn = _psnr, _ssim
     except Exception as e:
-        print(f"  [metrics] skimage unavailable ({e}); PSNR/SSIM set to NaN.")
-        psnr = np.full(T, np.nan); ssim = np.full(T, np.nan)
+        print(f"  [metrics] skimage import failed ({e!r}); PSNR/SSIM disabled.")
+
+    psnr = np.full(T, np.nan, dtype=np.float64)
+    ssim = np.full(T, np.nan, dtype=np.float64)
+    if psnr_fn is not None:
+        # SSIM default win_size=7 requires H,W >= 7; pick safe odd win_size.
+        H, W = gt01.shape[1:]
+        win = min(7, H if H % 2 == 1 else H - 1, W if W % 2 == 1 else W - 1)
+        win = max(3, win - (1 - win % 2))  # force odd, >= 3
+        n_fail = 0; first_err = None
+        for t in range(T):
+            try:
+                psnr[t] = psnr_fn(gt01[t], recon01[t], data_range=1.0)
+            except Exception as e:
+                n_fail += 1
+                if first_err is None:
+                    first_err = repr(e)
+            try:
+                ssim[t] = ssim_fn(gt01[t], recon01[t], data_range=1.0, win_size=win)
+            except Exception as e:
+                n_fail += 1
+                if first_err is None:
+                    first_err = repr(e)
+        if n_fail:
+            print(f"  [metrics] {n_fail} per-frame PSNR/SSIM call(s) failed "
+                  f"(first error: {first_err}).")
 
     # -- LPIPS via lpips package (AlexNet) ------------------------------------
     lpips_vals: np.ndarray
@@ -713,9 +752,15 @@ def main() -> None:
     ap.add_argument("--no_normalize_flux", action="store_true")
 
     # Runtime
-    ap.add_argument("--infer_batch_size", type=int, default=256)
+    ap.add_argument("--infer_batch_size", type=int, default=1024,
+                    help="Pixels per DiffPIR batch. Larger = faster if VRAM allows. "
+                         "Try 512 if OOM, 2048/4096 on an A100.")
     ap.add_argument("--seed",             type=int, default=42)
-    ap.add_argument("--use_amp",          action="store_true")
+    ap.add_argument("--use_amp",          dest="use_amp", action="store_true",
+                    default=True,
+                    help="Mixed-precision model forward (default: on for CUDA).")
+    ap.add_argument("--no_amp",           dest="use_amp", action="store_false",
+                    help="Disable AMP and run the model in full fp32.")
     ap.add_argument("--compile_model",    action="store_true")
     ap.add_argument("--mp4_fps",          type=int, default=30)
     ap.add_argument("--save_raw_binary",  action="store_true", default=True,
@@ -865,10 +910,13 @@ def main() -> None:
         log_flux_hat[sl] = x_hat[:, 0, :].cpu().numpy().astype(np.float32)
 
     # --- 8) Reshape reconstruction & save ----------------------------------
+    # Clip log-flux before exp to avoid +Inf overflows from runaway samples.
+    log_flux_hat_c = np.clip(log_flux_hat.astype(np.float64), -30.0, 25.0)
     if args.x_param == "log":
-        flux_hat_flat = np.exp(log_flux_hat.astype(np.float64))
+        flux_hat_flat = np.exp(log_flux_hat_c)
     else:
-        flux_hat_flat = np.expm1(log_flux_hat.astype(np.float64))
+        flux_hat_flat = np.expm1(log_flux_hat_c)
+    flux_hat_flat = np.nan_to_num(flux_hat_flat, nan=0.0, posinf=0.0, neginf=0.0)
     flux_hat_flat = np.maximum(flux_hat_flat, 0.0)
     recon_thw = flux_hat_flat.T.reshape(seq_len, H, W).astype(np.float32)
 
